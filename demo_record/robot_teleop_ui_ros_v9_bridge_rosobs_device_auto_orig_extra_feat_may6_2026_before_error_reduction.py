@@ -824,7 +824,7 @@ COMMAND_SMOOTH_STEP_SIZES = [
 
 DEFAULT_COMMAND_SMOOTH_DELAY_S = 0.02
 UI_REFRESH_MS = 100
-DEFAULT_BASE_ROTATE_STEP_DEG = 1.0
+DEFAULT_BASE_ROTATE_STEP_DEG = 0.2
 DEFAULT_BASE_ROTATE_STEP_DELAY_S = 0.10
 # Main v9 UI step-size defaults (single place to edit).
 # Order:
@@ -898,7 +898,7 @@ def _derive_ui_step_defaults(
 
     out = [
         float(np.clip(base_lin, DEVICE_BASE_STEP_MIN_M, DEVICE_BASE_STEP_MAX_M)),
-        float(np.clip(base_rot_deg, 0.5, 30.0)),
+        float(np.clip(base_rot_deg, 0.2, 25.0)),
         float(np.clip(arm_step, DEVICE_ARM_STEP_MIN, DEVICE_ARM_STEP_MAX)),
         float(np.clip(head_step, 0.01, 0.30)),
         float(np.clip(wrist_step, 0.01, 0.30)),
@@ -964,7 +964,7 @@ ACTION_MOVE_TIMEOUT_HOME_S = 12.0
 AUTO_LOOP_GRASP_HOLD_S = 3.0
 # Worker-side motion tuning (passed from UI at connect time).
 WORKER_TUNE_NAV_BLOCKING_POS_TOL_M = 0.05
-WORKER_TUNE_NAV_BLOCKING_YAW_TOL_DEG = 1.0
+WORKER_TUNE_NAV_BLOCKING_YAW_TOL_DEG = 3.5
 WORKER_TUNE_ARM_TO_TOL_BASE_X_M = 0.04
 WORKER_TUNE_ARM_TO_TOL_LIFT_M = 0.03
 WORKER_TUNE_ARM_TO_TOL_ARM_M = 0.03
@@ -1032,11 +1032,6 @@ CAMERA_VIEW_PARK_LIFT_M = 0.85 # 0.75
 # If False, skip the extra park move after startup/return flows.
 # Useful when DEFAULT_INIT_CMD_QPOS8 already matches CAMERA_VIEW_PARK_* targets.
 ENABLE_CAMERA_VIEW_PARK_MOVE = False
-# Auto-correct base theta drift after base-x translations using initial
-# (first-observed after connect) odom theta as reference.
-BASE_THETA_AUTOCORRECT_ENABLED = True
-BASE_THETA_AUTOCORRECT_THRESHOLD_DEG = 1.5
-BASE_THETA_AUTOCORRECT_COOLDOWN_S = 0.30
 # Clip IK wrist-yaw target around startup yaw to simplify demonstrations.
 IK_WRIST_YAW_CLIP_AROUND_INIT_DEG = 10.0
 # Auto-loop replay augmentation:
@@ -2689,8 +2684,6 @@ class StretchAIDemoBridge:
         self._base_theta = 0.0
         self._manip_base_x = 0.0
         self._base_y0: float | None = None
-        self._initial_base_pose_xytheta: list[float] | None = None
-        self._last_base_theta_autocorrect_t = 0.0
         self.command_base_pose_xytheta: list[float] | None = [0.0, 0.0, 0.0]
         self.command_base_pose_last_wall_time: float | None = None
         self._command_latched_qpos10: list[float] = [0.0] * 10
@@ -2789,21 +2782,6 @@ class StretchAIDemoBridge:
                         if self._base_y0 is None:
                             self._base_y0 = float(pose[1])
                         self._base_theta = float(pose[2])
-                        if not (
-                            isinstance(self._initial_base_pose_xytheta, list)
-                            and len(self._initial_base_pose_xytheta) >= 3
-                        ):
-                            self._initial_base_pose_xytheta = [
-                                float(self._base_x),
-                                float(self._base_y),
-                                float(self._base_theta),
-                            ]
-                            print(
-                                "[base_init_pose] latched first odom pose "
-                                f"x={float(self._base_x):+.4f} "
-                                f"y={float(self._base_y):+.4f} "
-                                f"theta={float(math.degrees(self._base_theta)):+.2f}deg"
-                            )
                     # Keep command pose latched to sent-command history.
                     # Only initialize once from measurements at startup.
                     if self.command_base_pose_xytheta is None:
@@ -2856,77 +2834,6 @@ class StretchAIDemoBridge:
     @staticmethod
     def _wrap_angle(theta: float) -> float:
         return float(np.arctan2(np.sin(theta), np.cos(theta)))
-
-    def _maybe_latch_initial_base_pose(self) -> None:
-        with self._lock:
-            if isinstance(self._initial_base_pose_xytheta, list) and len(self._initial_base_pose_xytheta) >= 3:
-                return
-            x = float(self._base_x)
-            y = float(self._base_y)
-            theta = float(self._base_theta)
-            if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(theta)):
-                return
-            self._initial_base_pose_xytheta = [x, y, theta]
-            print(
-                "[base_init_pose] latched first odom pose "
-                f"x={x:+.4f} y={y:+.4f} theta={math.degrees(theta):+.2f}deg"
-            )
-
-    def _base_theta_error_from_initial_rad(self) -> float | None:
-        with self._lock:
-            if not (isinstance(self._initial_base_pose_xytheta, list) and len(self._initial_base_pose_xytheta) >= 3):
-                return None
-            cur_theta = float(self._base_theta)
-            init_theta = float(self._initial_base_pose_xytheta[2])
-        if not (math.isfinite(cur_theta) and math.isfinite(init_theta)):
-            return None
-        return float(self._wrap_angle(cur_theta - init_theta))
-
-    def _autocorrect_base_theta_if_needed(
-        self,
-        *,
-        reason: str = "",
-        threshold_deg: float = BASE_THETA_AUTOCORRECT_THRESHOLD_DEG,
-    ) -> bool:
-        if not bool(BASE_THETA_AUTOCORRECT_ENABLED):
-            return True
-        now = time.time()
-        if (now - float(self._last_base_theta_autocorrect_t)) < float(BASE_THETA_AUTOCORRECT_COOLDOWN_S):
-            return True
-        self._maybe_latch_initial_base_pose()
-        err_rad = self._base_theta_error_from_initial_rad()
-        if err_rad is None:
-            return True
-        err_deg = abs(float(math.degrees(err_rad)))
-        if err_deg < float(threshold_deg):
-            return True
-
-        # Keep command-pose aligned to measured pose before correction command.
-        self.stop_base()
-        self.sync_base_command_pose_to_observation()
-        with self._lock:
-            obs_x = float(self._base_x)
-            obs_y = float(self._base_y0 if self._base_y0 is not None else self._base_y)
-            obs_theta = float(self._base_theta)
-        correction_rad = float(-err_rad)
-        target_theta = float(self._wrap_angle(obs_theta + correction_rad))
-        timeout_s = max(2.0, 2.0 + 6.0 * abs(correction_rad))
-        ok = self.move_base_to(
-            x=float(obs_x),
-            y=float(obs_y),
-            theta=float(target_theta),
-            blocking=True,
-            timeout_s=float(timeout_s),
-        )
-        self._last_base_theta_autocorrect_t = time.time()
-        print(
-            "[base_theta_autocorrect] "
-            f"reason={reason or 'unspecified'} "
-            f"err={float(math.degrees(err_rad)):+.2f}deg "
-            f"cmd={float(math.degrees(correction_rad)):+.2f}deg "
-            f"ok={bool(ok)}"
-        )
-        return bool(ok)
 
     def _get_ros_minus_wall_ns(self) -> int | None:
         client = self._ros_obs_client
@@ -3559,7 +3466,7 @@ class StretchAIDemoBridge:
                 head_tilt = float(np.clip(float(q_src[6]), self.JOINT_LIMITS[6][0], self.JOINT_LIMITS[6][1]))
                 gripper = float(np.clip(float(q_src[7]), self.JOINT_LIMITS[7][0], self.JOINT_LIMITS[7][1]))
 
-            ok = self.execute_arm_to(
+            return self.execute_arm_to(
                 [target_manip_base_x, lift, arm, wrist_yaw, wrist_pitch, wrist_roll],
                 gripper=gripper,
                 head=[head_pan, head_tilt],
@@ -3567,10 +3474,6 @@ class StretchAIDemoBridge:
                 timeout_s=float(timeout_s),
                 reliable=False,
             )
-            if bool(ok):
-                self._refresh_state_from_ros_topic(timeout_s=0.25)
-                self._autocorrect_base_theta_if_needed(reason="manual_base_x_step")
-            return bool(ok)
         except Exception:
             return False
 
@@ -3582,14 +3485,15 @@ class StretchAIDemoBridge:
                 obs_y = float(self._base_y0 if self._base_y0 is not None else self._base_y)
                 obs_theta = float(self._base_theta)
                 target_theta = self._wrap_angle(obs_theta + float(step_dtheta))
-                # Seed command-pose from current observation so move_base_to
+                # Seed command-pose from current observation so move_base_relative
                 # records an absolute target for this click.
                 self.command_base_pose_xytheta = [obs_x, obs_y, obs_theta]
                 self.command_base_pose_last_wall_time = time.time()
-            return self.move_base_to(
-                x=float(obs_x),
-                y=float(obs_y),
-                theta=float(target_theta),
+            rel_theta = self._wrap_angle(target_theta - obs_theta)
+            return self.move_base_relative(
+                dx=0.0,
+                dy=0.0,
+                dtheta=float(rel_theta),
                 blocking=False,
                 timeout_s=float(timeout_s),
             )
@@ -3782,8 +3686,6 @@ class StretchAIDemoBridge:
         rpc = self._rpc
         if rpc is None:
             return False
-        x_only_move = bool(abs(float(dx)) > 1e-6 and abs(float(dy)) <= 1e-12 and abs(float(dtheta)) <= 1e-12)
-        ok = False
         pre_stamp_ns = self._latest_ros_observation_stamp_ns()
         q_event = None
         pose_event = None
@@ -3829,88 +3731,13 @@ class StretchAIDemoBridge:
             with self._lock:
                 self._last_exec_result = dict(res) if isinstance(res, dict) else {"result": res}
             ok = bool(isinstance(res, dict) and res.get("ok", False))
+            return ok
         except Exception as exc:
             now = time.time()
             if now - self._last_cmd_error_t > 2.0:
                 self._last_cmd_error_t = now
                 print(f"[stretch_ai_bridge] move_base_relative error: {exc}", file=sys.stderr)
-            ok = False
-        finally:
-            if bool(blocking):
-                self._refresh_state_from_ros_topic(
-                    require_newer_than_ns=pre_stamp_ns,
-                    timeout_s=0.60,
-                )
-            else:
-                self._refresh_state_from_ros_topic(timeout_s=0.0)
-        if ok and x_only_move:
-            if not bool(blocking):
-                # Non-blocking base commands may still be in-flight; wait briefly
-                # so drift check uses a fresher odom sample.
-                self._refresh_state_from_ros_topic(timeout_s=0.25)
-            self._autocorrect_base_theta_if_needed(reason="move_base_relative_x")
-        return bool(ok)
-
-    def move_base_to(
-        self,
-        x: float | None = None,
-        y: float | None = None,
-        theta: float | None = None,
-        *,
-        blocking: bool = False,
-        timeout_s: float = 3.0,
-    ) -> bool:
-        """Send an absolute base x/y/theta target through bridge navigation action."""
-        rpc = self._rpc
-        if rpc is None:
             return False
-        ok = False
-        pre_stamp_ns = self._latest_ros_observation_stamp_ns()
-        q_event = None
-        pose_event = None
-        with self._lock:
-            if self.command_base_pose_xytheta is None:
-                self.command_base_pose_xytheta = [float(self._base_x), float(self._base_y), float(self._base_theta)]
-            cur_x, cur_y, cur_theta = [float(v) for v in self.command_base_pose_xytheta]
-            tgt_x = float(cur_x if x is None else x)
-            tgt_y = float(cur_y if y is None else y)
-            tgt_theta = self._wrap_angle(float(cur_theta if theta is None else theta))
-            self.command_base_pose_xytheta = [tgt_x, tgt_y, tgt_theta]
-            self.command_base_pose_last_wall_time = time.time()
-            pose_event = [tgt_x, tgt_y, tgt_theta]
-            q_now = list(self._command_latched_qpos10)
-            q_event = [float(v) for v in q_now[:10]]
-            if len(q_event) < 10:
-                q_event += [0.0] * (10 - len(q_event))
-            q_event[8] = 0.0
-            q_event[9] = 0.0
-
-        self._record_command_event(
-            "move_base_to",
-            qpos10=q_event,
-            command_pose_xytheta=pose_event,
-        )
-        try:
-            res = rpc.request(
-                "move_base_to",
-                {
-                    "x": None if x is None else float(x),
-                    "y": None if y is None else float(y),
-                    "theta": None if theta is None else float(theta),
-                    "blocking": bool(blocking),
-                    "timeout_s": float(timeout_s),
-                },
-                timeout_s=max(2.0, float(timeout_s) + 2.0),
-            )
-            with self._lock:
-                self._last_exec_result = dict(res) if isinstance(res, dict) else {"result": res}
-            ok = bool(isinstance(res, dict) and res.get("ok", False))
-        except Exception as exc:
-            now = time.time()
-            if now - self._last_cmd_error_t > 2.0:
-                self._last_cmd_error_t = now
-                print(f"[stretch_ai_bridge] move_base_to error: {exc}", file=sys.stderr)
-            ok = False
         finally:
             if bool(blocking):
                 self._refresh_state_from_ros_topic(
@@ -3919,7 +3746,6 @@ class StretchAIDemoBridge:
                 )
             else:
                 self._refresh_state_from_ros_topic(timeout_s=0.0)
-        return bool(ok)
 
     def rotate_base_relative(self, theta_rad: float, timeout_s: float = 10.0) -> bool:
         """Rotate base by relative yaw angle using bridge xyt navigation action."""
@@ -4307,7 +4133,7 @@ class StretchAIDemoBridge:
         self.command_smooth_delay_s = float(np.clip(float(delay_s), 0.01, 0.5))
 
     def set_base_rotate_step_deg(self, step_deg: float) -> None:
-        self.base_rotate_step_rad = float(np.deg2rad(np.clip(float(step_deg), 0.5, 30.0)))
+        self.base_rotate_step_rad = float(np.deg2rad(np.clip(float(step_deg), 5.8, 45.0)))
 
     def set_base_rotate_step_delay(self, delay_s: float) -> None:
         self.base_rotate_step_delay_s = float(np.clip(float(delay_s), 0.0, 0.5))
@@ -4812,7 +4638,7 @@ class RobotTeleopBridgeUI(QMainWindow):
 
         # Base manual controls use per-tick relative chunks (dx in meters, dtheta in degrees).
         self.base_linear_step_m = 0.03
-        self.base_theta_step_deg = 1.0
+        self.base_theta_step_deg = 4.0
         self.arm_speed = 0.01
         self.head_speed = 0.05
         self.wrist_speed = 0.05
@@ -5005,8 +4831,8 @@ class RobotTeleopBridgeUI(QMainWindow):
         btn_left.released.connect(self._stop_base)
         btn_right.pressed.connect(lambda: self._set_base(0.0, -self.base_theta_step_deg))
         btn_right.released.connect(self._stop_base)
-        btn_left.setEnabled(True)
-        btn_right.setEnabled(True)
+        btn_left.setEnabled(False)
+        btn_right.setEnabled(False)
 
         layout.addWidget(btn_fwd, 0, 1)
         layout.addWidget(btn_left, 1, 0)
@@ -5025,8 +4851,8 @@ class RobotTeleopBridgeUI(QMainWindow):
         )
         layout.addLayout(
             self._make_speed_slider(
-                min_val=0.5,
-                max_val=30.0,
+                min_val=5.8,
+                max_val=20.0,
                 default_val=self.base_theta_step_deg,
                 on_change=lambda v: setattr(self, "base_theta_step_deg", v),
                 label_text="Rotation Step",
@@ -5856,7 +5682,7 @@ class RobotTeleopUI(QMainWindow):
         self._ui_step_defaults = [float(v) for v in ROBOT_UI_STEP_DEFAULTS]
         self.linear_speed = float(self._ui_step_defaults[UI_STEP_IDX_BASE_LINEAR])       # m per base command step
         # Rotation step used by base rotate buttons (kept in rad for command path).
-        self.base_angle_step_deg = float(DEFAULT_BASE_ROTATE_STEP_DEG)
+        self.base_angle_step_deg = float(self._ui_step_defaults[UI_STEP_IDX_BASE_ROTATE_DEG])
         self.angular_speed = float(np.deg2rad(self.base_angle_step_deg))
         self.arm_speed = float(self._ui_step_defaults[UI_STEP_IDX_ARM])         # m or rad increment per update
         self.head_speed = float(self._ui_step_defaults[UI_STEP_IDX_HEAD])       # rad increment per update
@@ -6684,6 +6510,7 @@ class RobotTeleopUI(QMainWindow):
             lambda: self.start_control('base_angular', float(np.deg2rad(self.base_angle_step_deg)))
         )
         btn_left.released.connect(lambda: self.stop_control('base_angular'))
+        btn_left.setEnabled(False)
         base_layout.addWidget(btn_left, 0, 2)
 
         btn_backward = QPushButton("↓")
@@ -6700,6 +6527,7 @@ class RobotTeleopUI(QMainWindow):
             lambda: self.start_control('base_angular', -float(np.deg2rad(self.base_angle_step_deg)))
         )
         btn_right.released.connect(lambda: self.stop_control('base_angular'))
+        btn_right.setEnabled(False)
         base_layout.addWidget(btn_right, 0, 3)
 
         move_cm_label = QLabel("Move (cm)")
@@ -6746,14 +6574,14 @@ class RobotTeleopUI(QMainWindow):
         base_layout.addWidget(move_dist_btn, 1, 2)
 
         base_linear_available = ("base_linear" in available_controls)
-        base_angular_available = ("base_angular" in available_controls)
         btn_forward.setEnabled(base_linear_available)
         btn_backward.setEnabled(base_linear_available)
-        btn_left.setEnabled(base_angular_available)
-        btn_right.setEnabled(base_angular_available)
+        # Keep UI behavior unchanged: base rotation buttons remain hidden/disabled in this panel.
+        btn_left.setEnabled(False)
+        btn_right.setEnabled(False)
 
         base_group.setLayout(base_layout)
-        base_group.setVisible(base_linear_available or base_angular_available)
+        base_group.setVisible(base_linear_available or ("base_angular" in available_controls))
         layout.addWidget(base_group)
 
         # Arm controls
@@ -7003,8 +6831,8 @@ class RobotTeleopUI(QMainWindow):
         )
         dlg_layout.addLayout(
             self._create_speed_slider(
-                0.5,
-                30.0,
+                5.8,
+                20.0,
                 self.base_angle_step_deg,
                 set_base_angle_step_deg,
                 label_text="Base rotation step (deg)",
@@ -12317,7 +12145,6 @@ class RobotTeleopUI(QMainWindow):
         current = np.asarray(current[:6], dtype=np.float32).reshape(-1)
         if current.shape[0] < 6 or not np.all(np.isfinite(current)):
             current = target.copy()
-        base_x_changed = bool(abs(float(target[0]) - float(current[0])) > 1e-6)
 
         grip_cmd = None
         grip_hold_cmd = None
@@ -12515,11 +12342,6 @@ class RobotTeleopUI(QMainWindow):
             # Keep UI-side command memory aligned so subsequent arm stages do not
             # restart gripper ramps from stale cached values.
             self._set_manual_gripper_override(float(grip_cmd))
-        if bool(base_x_changed) and hasattr(self.ros_node, "_autocorrect_base_theta_if_needed"):
-            try:
-                self.ros_node._autocorrect_base_theta_if_needed(reason="_execute_arm_to_chunked_base_x")
-            except Exception:
-                pass
         return True
 
     def _freeze_streaming_commands_to_current_state(self) -> None:
