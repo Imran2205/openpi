@@ -1,0 +1,9892 @@
+#!/usr/bin/env python3
+"""Bridge-command teleop + ROS-topic synchronized demo recorder.
+
+This variant uses:
+- ROS2 topics (`rclpy`) for all observations (images + robot state)
+- stretch_ai bridge worker only for robot commands / IK execution
+
+Recorded samples are timestamped with ROS message header time (head RGB when
+available), and state rows are aligned to that reference stamp.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import colorsys
+from collections import deque
+import json
+import logging
+import math
+import os
+import queue
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import traceback
+import types
+from pathlib import Path
+from typing import Any
+
+os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = ""
+os.environ.pop("QT_QPA_PLATFORM_PLUGIN_PATH", None)
+
+import cv2
+import numpy as np
+try:
+    from flask import Flask, jsonify, request
+except Exception as exc:  # pragma: no cover - environment dependent
+    Flask = None  # type: ignore[assignment]
+    jsonify = None  # type: ignore[assignment]
+    request = None  # type: ignore[assignment]
+    _FLASK_IMPORT_ERROR: Exception | None = exc
+else:
+    _FLASK_IMPORT_ERROR = None
+from ultralytics import SAM
+from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QThread
+from PyQt6.QtCore import QTimer
+from PyQt6.QtCore import QSize
+from PyQt6.QtCore import pyqtSignal
+from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QComboBox
+from PyQt6.QtWidgets import QFileDialog
+from PyQt6.QtWidgets import QGridLayout
+from PyQt6.QtWidgets import QGroupBox
+from PyQt6.QtWidgets import QHBoxLayout
+from PyQt6.QtWidgets import QLabel
+from PyQt6.QtWidgets import QLineEdit
+from PyQt6.QtWidgets import QListWidget
+from PyQt6.QtWidgets import QListWidgetItem
+from PyQt6.QtWidgets import QMainWindow
+from PyQt6.QtWidgets import QMenu
+from PyQt6.QtWidgets import QMessageBox
+from PyQt6.QtWidgets import QPushButton
+from PyQt6.QtWidgets import QScrollArea
+from PyQt6.QtWidgets import QTableWidget
+from PyQt6.QtWidgets import QTableWidgetItem
+from PyQt6.QtWidgets import QSlider
+from PyQt6.QtWidgets import QSizePolicy
+from PyQt6.QtWidgets import QTreeWidget
+from PyQt6.QtWidgets import QTreeWidgetItem
+from PyQt6.QtWidgets import QVBoxLayout
+from PyQt6.QtWidgets import QWidget
+from PyQt6.QtGui import QAction
+from PyQt6.QtGui import QColor
+from PyQt6.QtGui import QImage
+from PyQt6.QtGui import QKeySequence
+from PyQt6.QtGui import QPixmap
+from PyQt6.QtGui import QShortcut
+
+
+def adjust_gamma(image: np.ndarray, gamma: float = 1.0):
+    invGamma = 1.0 / gamma
+    table = np.array([((i / 255.0) ** invGamma) * 255 for i in np.arange(0, 256)]).astype("uint8")
+    return cv2.LUT(image, table)
+
+_BLE_IMPORT_ERROR: Exception | None = None
+try:
+    from bleak import BleakClient
+    from bleak import BleakScanner
+except Exception as exc:  # pragma: no cover - environment dependent
+    BleakClient = None  # type: ignore[assignment]
+    BleakScanner = None  # type: ignore[assignment]
+    _BLE_IMPORT_ERROR = exc
+
+_RCLPY_IMPORT_ERROR: Exception | None = None
+try:
+    import rclpy
+    from rclpy.node import Node
+    from rclpy.executors import MultiThreadedExecutor
+    from rclpy.qos import qos_profile_sensor_data
+    from sensor_msgs.msg import Image
+    from sensor_msgs.msg import JointState
+    from sensor_msgs.msg import CameraInfo
+    from sensor_msgs.msg import Imu
+    from sensor_msgs.msg import BatteryState
+    from sensor_msgs.msg import MagneticField
+    from nav_msgs.msg import Odometry
+    from cv_bridge import CvBridge
+    from cv_bridge import CvBridgeError
+    from tf2_ros import Buffer
+    from tf2_ros import TransformListener
+except Exception as exc:  # pragma: no cover - environment dependent
+    _RCLPY_IMPORT_ERROR = exc
+
+    class _DummyRclpy:
+        class time:
+            class Time:
+                def __init__(self, *args, **kwargs):
+                    pass
+
+        class duration:
+            class Duration:
+                def __init__(self, *, seconds: float = 0.0):
+                    self.seconds = float(seconds)
+
+    rclpy = _DummyRclpy()  # type: ignore[assignment]
+    Node = object  # type: ignore[assignment]
+    MultiThreadedExecutor = None  # type: ignore[assignment]
+    qos_profile_sensor_data = None  # type: ignore[assignment]
+    Image = object  # type: ignore[assignment]
+    JointState = object  # type: ignore[assignment]
+    CameraInfo = object  # type: ignore[assignment]
+    Imu = object  # type: ignore[assignment]
+    BatteryState = object  # type: ignore[assignment]
+    MagneticField = object  # type: ignore[assignment]
+    Odometry = object  # type: ignore[assignment]
+    CvBridge = object  # type: ignore[assignment]
+    CvBridgeError = Exception  # type: ignore[assignment]
+    Buffer = object  # type: ignore[assignment]
+    TransformListener = object  # type: ignore[assignment]
+
+
+###############################################################################
+# Runtime configuration
+###############################################################################
+STRETCH_AI_REPO = "/home/ibk5106/Desktop/Projects/stretch_ai"
+STRETCH_AI_ENV_NAME = "stretch_ai"
+STRETCH_AI_WORKER_LAUNCHER = "mamba"
+STRETCH_AI_WORKER_PYTHON = "python"
+
+STRETCH_AI_ROBOT_IP = "192.168.1.10"
+STRETCH_AI_USE_REMOTE_COMPUTER = True
+STRETCH_AI_RECV_PORT = 4401
+STRETCH_AI_SEND_PORT = 4402
+STRETCH_AI_RECV_STATE_PORT = 4403
+STRETCH_AI_RECV_SERVO_PORT = 4404
+
+STRETCH_AI_CONNECT_TIMEOUT_S = 30.0
+STRETCH_AI_RPC_TIMEOUT_S = 8.0
+STRETCH_AI_OBS_POLL_HZ = 10.0
+STRETCH_AI_WORKER_JPEG_QUALITY = 85
+STRETCH_AI_ROTATE_HEAD_90_CW = False
+STRETCH_AI_WORKER_DEBUG = True
+STRETCH_AI_DEFAULT_OBS_SOURCE = "ros_topic"
+FORCE_ROS_TOPIC_OBSERVATION = True
+COMMAND_HISTORY_MAXLEN = 4096
+
+# ROS2 topic observation configuration.
+ROS_TOPICS_ROTATE_HEAD_90_CW = True
+ROS_TOPICS_CONNECT_TIMEOUT_S = 8.0
+
+HEAD_RGB_TOPIC = "/camera/color/image_raw"
+HEAD_DEPTH_TOPIC = "/camera/aligned_depth_to_color/image_raw"
+HEAD_CAMERA_INFO_TOPIC = "/camera/aligned_depth_to_color/camera_info"
+WRIST_RGB_TOPIC = "/gripper_camera/color/image_rect_raw"
+WRIST_DEPTH_TOPIC = "/gripper_camera/aligned_depth_to_color/image_raw"
+WRIST_CAMERA_INFO_TOPIC = "/gripper_camera/aligned_depth_to_color/camera_info"
+
+JOINT_STATE_TOPIC = "/stretch/joint_states"
+ODOM_TOPIC = "/odom"
+IMU_MOBILE_BASE_TOPIC = "/imu_mobile_base"
+IMU_WRIST_TOPIC = "/imu_wrist"
+IMU_CAMERA_ACCEL_TOPIC = "/camera/accel/sample"
+IMU_CAMERA_GYRO_TOPIC = "/camera/gyro/sample"
+MAGNETOMETER_TOPIC = "/magnetometer_mobile_base"
+BATTERY_TOPIC = "/battery"
+
+# Recorder defaults (same style as v5)
+DEMO_RECORD_FPS = 10
+DEMO_RECORD_QUEUE_MAX = 20
+DEFAULT_DATASET_ROOT = str((Path.cwd() / "demo_record/stretch_recordings_v9_simple").resolve())
+DEMO_RECORD_RGB_DEFAULT_FORMAT = "jpg"
+DEMO_RECORD_RGB_JPEG_QUALITY = 90
+
+# External 3-encoder input device integration (direct BLE)
+DEVICE_BLE_NAME = "ESP32C3-IMU"
+DEVICE_BLE_CHARACTERISTIC_UUID = "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+DEVICE_BLE_RETRY_SLEEP_S = 0.5
+DEVICE_POLL_HZ = 50.0
+DEVICE_ENCODER_DEADBAND = 1e-4
+DEVICE_IMU_YAW_GAIN = 1.0
+DEVICE_IMU_YAW_MAX_STEP_RAD = 0.10
+DEVICE_DEBUG_PRINT = False
+DEVICE_DEBUG_PRINT_MAX = 0
+DEVICE_BASE_STEP_M = 0.12
+DEVICE_LIFT_STEP_M = 0.02
+DEVICE_ARM_STEP_M = 0.02
+DEVICE_GRIPPER_STEP = 0.02
+# Device precision-level step mapping ranges (same ranges as UI sliders).
+DEVICE_PREC_LEVELS = 5  # prec 0..4
+DEVICE_BASE_STEP_MIN_M = 0.005
+DEVICE_BASE_STEP_MAX_M = 0.20
+DEVICE_ARM_STEP_MIN = 0.005
+DEVICE_ARM_STEP_MAX = 0.10
+DEVICE_GRIPPER_STEP_MIN = 0.005
+DEVICE_GRIPPER_STEP_MAX = 0.10
+
+# Command smoothing (same values as v5)
+COMMAND_SMOOTH_STEP_SIZES = [
+    0.005,
+    0.005,
+    0.020,
+    0.020,
+    0.020,
+    0.020,
+    0.020,
+    0.005,
+    0.020,
+    0.030,
+]
+
+DEFAULT_COMMAND_SMOOTH_DELAY_S = 0.010
+UI_REFRESH_MS = 100
+DEFAULT_BASE_ROTATE_STEP_DEG = 0.2
+DEFAULT_BASE_ROTATE_STEP_DELAY_S = 0.10
+# In bridge arm_to mode, base motion is available as manipulation base_x only.
+MANIP_BASE_X_LIMITS = (-1.35, 1.35)
+
+# v5 behavior constants (kept for full feature parity with robot_teleop_ui_ros_v5.py).
+COMPENSATE_HEAD_ON_ROTATE = True
+REACH_HEIGHT_CLEARANCE = 0.20
+GRASP_PITCH_DEG = -40.0
+GRASP_LATERAL_TRIM_M = 0.03
+GRASP_REACH_TRIM_M = 0.025
+GRASP_CLOSE_EXTRA_M = 0.015
+GRASP_STALK_LENGTH_M = 0.2716
+GRASP_RESIDUAL_ROT_GAIN = 0.60
+GRASP_RESIDUAL_ROT_MAX_DEG = 8.0
+GRASP_REACH_CORR_GAIN = 0.8
+GRASP_REACH_CORR_MAX_STEP_M = 0.04
+GRASP_REACH_CORR_THRESH_M = 0.008
+GRASP_REACH_CORR_ITERS = 2
+GRASP_PRELOWER_VERIFY_TIP_MARGIN_M = 0.03
+GRASP_TIP_Z_MARGIN_M = 0.08
+GRASP_TARGET_Z_OFFSET_M = 0.04
+SCRIPT_STAGE_WAIT_CAP_S = 6.0
+SAM_CC_MIN_AREA_PX = 600
+SAM_CC_MIN_WIDTH_PX = 18
+SAM_CC_MIN_HEIGHT_PX = 18
+
+# v6: use stretch_ai IK/open-loop planning for reach/grasp instead of custom geometry.
+USE_STRETCH_AI_IK_GRASP_PIPELINE = True
+IK_PREGRASP_DISTANCE_M = 0.10
+IK_LIFT_DISTANCE_M = 0.20
+IK_SAFE_LIFT_M = 0.95
+# Return-stage safety lift kept independent from startup/default lift.
+RETURN_SAFE_LIFT_M = 0.95
+# Calibration offset applied to IK grasp base_x before execution.
+# Positive pushes farther forward; negative pulls back.
+IK_GRASP_BASE_X_OFFSET_M = 0.0
+# Gripper partial-close tuning for grasp:
+# close target = open_target - (IK_GRIPPER_CLOSE_DELTA_M / 0.22)
+# where 0.22m per joint-unit comes from existing width->joint mapping.
+IK_GRIPPER_CLOSE_DELTA_M = 0.035  # tune between 0.02 .. 0.05 (2-5 cm)
+IK_GRIPPER_CLOSE_MIN_JOINT = -0.02  # prevent hard full-close motor load
+RETURN_USE_NAV_BASE_POSE_CORRECTION = False
+AUTO_SEND_DEFAULT_POSE_ON_CONNECT = True
+DEFAULT_INIT_LIFT_M = 0.95
+# Startup command target (non-base joints) shown in the UI command table.
+# Order: [arm_extension, arm_lift, wrist_yaw, wrist_pitch, wrist_roll, head_pan, head_tilt, gripper]
+# DEFAULT_INIT_CMD_QPOS8 = [0.0, 0.95, -1.2, -0.535, 0.0, -0.92, -0.66, 0.22505]
+# DEFAULT_INIT_CMD_QPOS8 = [0.0, 0.85, 0.28, -0.6981, 0.0, -1.56, -0.75, 0.22505]
+DEFAULT_INIT_CMD_QPOS8 = [0.0, 0.85, 0.28, -0.6981, 0.0, -1.5708, -0.7854, 0.22505]
+# DEFAULT_INIT_CMD_QPOS8 = [0.01, 0.78, 0.0, -1.5, 0.0, -1.5707963267948966, -0.7853981633974483, 0.0]
+ALLOW_COMMAND_SYNC_FROM_STATE = False
+
+# v7: geometry-aware grasp surface classification
+# If visible-surface normal is mostly horizontal (small |normal.z|), treat as
+# vertical-face grasp (door handle / knob / cabinet pull / side grasp).
+VERTICAL_SURFACE_NORMAL_Z_MAX = 0.45
+HORIZONTAL_SURFACE_NORMAL_Z_MIN = 0.75
+VERTICAL_OBJECT_HEIGHT_MIN_M = 0.15
+VERTICAL_OBJECT_XY_SPAN_MAX_M = 0.12
+# For vertical-face grasps: pause at reach target - standoff instead of lift + margin.
+IK_REACH_STANDOFF_M = 0.10
+# Keep direct single-click grasp behavior aligned with queued grasp behavior.
+# Queued grasp currently does not pass geometry-class strategy into IK stage
+# selection, so default this off to avoid direct-only vertical misclassification.
+DIRECT_GRASP_USE_GEOMETRY_STRATEGY = False
+
+
+class PointStamped:
+    """Minimal geometry_msgs.msg.PointStamped-compatible container."""
+
+    def __init__(self):
+        self.header = types.SimpleNamespace(frame_id="", stamp=None)
+        self.point = types.SimpleNamespace(x=0.0, y=0.0, z=0.0)
+
+
+class EncoderDeviceHttpBridge:
+    """Receives IMU+encoder packets directly over BLE and stores latest samples."""
+
+    def __init__(
+        self,
+        *,
+        device_name: str = DEVICE_BLE_NAME,
+        characteristic_uuid: str = DEVICE_BLE_CHARACTERISTIC_UUID,
+    ):
+        self.device_name = str(device_name)
+        self.characteristic_uuid = str(characteristic_uuid)
+        self._queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=64)
+        self._worker_thread: threading.Thread | None = None
+        self._stop_event = threading.Event()
+        self._started = False
+        self._last_error: str | None = None
+        self._require_calibration = True
+        self._q_ref_xyzw: np.ndarray | None = None
+        s2 = float(math.sqrt(0.5))
+        # Equivalent to scipy: R.from_euler('yx', [90, 0], degrees=True)
+        self._mount_q_xyzw = np.array([0.0, s2, 0.0, s2], dtype=np.float64)
+
+    def _safe_put(self, payload: dict[str, Any]) -> None:
+        if self._queue.full():
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                pass
+        try:
+            self._queue.put_nowait(payload)
+        except queue.Full:
+            pass
+
+    @staticmethod
+    def _quat_mul(a_xyzw: np.ndarray, b_xyzw: np.ndarray) -> np.ndarray:
+        ax, ay, az, aw = [float(v) for v in a_xyzw]
+        bx, by, bz, bw = [float(v) for v in b_xyzw]
+        return np.array(
+            [
+                aw * bx + ax * bw + ay * bz - az * by,
+                aw * by - ax * bz + ay * bw + az * bx,
+                aw * bz + ax * by - ay * bx + az * bw,
+                aw * bw - ax * bx - ay * by - az * bz,
+            ],
+            dtype=np.float64,
+        )
+
+    @staticmethod
+    def _quat_inv(q_xyzw: np.ndarray) -> np.ndarray:
+        x, y, z, w = [float(v) for v in q_xyzw]
+        n2 = x * x + y * y + z * z + w * w
+        if n2 <= 1e-12:
+            return np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
+        return np.array([-x / n2, -y / n2, -z / n2, w / n2], dtype=np.float64)
+
+    @staticmethod
+    def _quat_norm(q_xyzw: np.ndarray) -> np.ndarray:
+        n = float(np.linalg.norm(q_xyzw))
+        if n <= 1e-12:
+            return np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
+        return q_xyzw / n
+
+    def _parse_notify_line(self, line: str) -> dict[str, Any] | None:
+        txt = str(line).strip()
+        if not txt:
+            return None
+        parts = [p.strip() for p in txt.split(",")]
+        # print(f"[device] notify line parts: {parts}")
+        if len(parts) < 5:
+            return None
+        try:
+            x = float(parts[1])
+            y = float(parts[2])
+            z = float(parts[3])
+            w = float(parts[4])
+        except (TypeError, ValueError):
+            return None
+        if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(z) and math.isfinite(w)):
+            return None
+
+        q_raw = np.array([x, y, z, w], dtype=np.float64)
+        q_cur = self._quat_mul(q_raw, self._mount_q_xyzw)
+
+        calibrate = self._require_calibration
+        if len(parts) > 16:
+            try:
+                calibrate = calibrate or (int(float(parts[16])) == 1)
+            except (TypeError, ValueError):
+                pass
+        if calibrate:
+            self._q_ref_xyzw = q_cur.copy()
+            self._require_calibration = False
+
+        if self._q_ref_xyzw is not None:
+            q_corr = self._quat_mul(self._quat_inv(self._q_ref_xyzw), q_cur)
+        else:
+            q_corr = q_cur
+        q_corr = self._quat_norm(q_corr)
+
+        return {
+            "quat": [
+                f"{float(q_corr[0]):.6f}",
+                f"{float(q_corr[1]):.6f}",
+                f"{float(q_corr[2]):.6f}",
+                f"{float(q_corr[3]):.6f}",
+            ],
+            "raw": parts[5:],
+            "line": txt,
+            "parts": parts,
+        }
+
+    async def _ble_loop(self) -> None:
+        if BleakClient is None or BleakScanner is None:
+            self._last_error = f"bleak import failed: {_BLE_IMPORT_ERROR}"
+            return
+
+        while not self._stop_event.is_set():
+            try:
+                device = await BleakScanner.find_device_by_filter(
+                    lambda d, ad: bool(d and d.name and self.device_name in d.name)
+                )
+            except Exception as exc:
+                self._last_error = f"BLE scan failed: {exc}"
+                await asyncio.sleep(float(DEVICE_BLE_RETRY_SLEEP_S))
+                continue
+
+            if not device:
+                self._last_error = f"BLE device not found: {self.device_name}"
+                await asyncio.sleep(float(DEVICE_BLE_RETRY_SLEEP_S))
+                continue
+
+            try:
+                async with BleakClient(device) as client:
+                    self._last_error = None
+
+                    def handle_notify(_sender: Any, data: Any) -> None:
+                        
+                        try:
+                            text = data.decode("utf-8").strip() # bytes(data).decode("utf-8", errors="ignore").replace("\x00", "")
+                        except Exception:
+                            return
+                        # print(f"[device] notify: {text}")
+                        for line in text.splitlines():
+                            payload = self._parse_notify_line(line)
+                            # print(f"[device] parsed payload: {payload}")
+                            if isinstance(payload, dict):
+                                self._safe_put(payload)
+
+                    await client.start_notify(self.characteristic_uuid, handle_notify)
+                    while not self._stop_event.is_set():
+                        await asyncio.sleep(0.1)
+                    try:
+                        await client.stop_notify(self.characteristic_uuid)
+                    except Exception:
+                        pass
+            except Exception as exc:
+                self._last_error = f"BLE connection failed: {exc}"
+                await asyncio.sleep(float(DEVICE_BLE_RETRY_SLEEP_S))
+
+    def _thread_main(self) -> None:
+        loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(self._ble_loop())
+        except Exception as exc:
+            self._last_error = str(exc)
+        finally:
+            try:
+                loop.stop()
+                loop.close()
+            except Exception:
+                pass
+
+    def start(self) -> bool:
+        if self._started:
+            return True
+        if BleakClient is None or BleakScanner is None:
+            self._last_error = f"bleak import failed: {_BLE_IMPORT_ERROR}"
+            return False
+        self._stop_event.clear()
+        self._worker_thread = threading.Thread(
+            target=self._thread_main,
+            daemon=True,
+            name="encoder_ble_bridge",
+        )
+        self._worker_thread.start()
+        self._started = True
+        return True
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        t = self._worker_thread
+        if t is not None and t.is_alive():
+            t.join(timeout=1.5)
+        self._worker_thread = None
+        self._started = False
+
+    def get_latest(self) -> dict[str, Any] | None:
+        latest = None
+        while True:
+            try:
+                latest = self._queue.get_nowait()
+            except queue.Empty:
+                break
+        return latest
+
+    def drain(self) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        while True:
+            try:
+                item = self._queue.get_nowait()
+                # print(item)
+            except queue.Empty:
+                break
+            if isinstance(item, dict):
+                items.append(item)
+        return items
+
+    @property
+    def last_error(self) -> str | None:
+        return self._last_error
+
+
+###############################################################################
+# Recorder (copied to preserve format)
+###############################################################################
+def _to_jsonable(obj):
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, (np.floating, np.integer)):
+        return obj.item()
+    if isinstance(obj, (list, tuple)):
+        return [_to_jsonable(v) for v in obj]
+    if isinstance(obj, dict):
+        return {k: _to_jsonable(v) for k, v in obj.items()}
+    return obj
+
+
+class LeRobotStyleRecorder:
+    """Episode recorder with LeRobot-like directory and naming conventions."""
+
+    def __init__(self, robot_type="stretch3", target_fps=DEMO_RECORD_FPS, queue_maxsize=DEMO_RECORD_QUEUE_MAX):
+        self.robot_type = robot_type
+        self.target_fps = float(target_fps)
+        self.queue_maxsize = int(queue_maxsize)
+        self.active = False
+        self.root = None
+        self.prompt = ""
+        self.episode_index = -1
+        self.frame_index = 0
+        self.start_wall_time = 0.0
+        self.writers = {}
+        self.paths = {}
+        self.episode_name = ""
+        self.chunk_name = ""
+        self.data_format = "jsonl"
+        self._sample_queue = queue.Queue(maxsize=self.queue_maxsize)
+        self._writer_thread = None
+        self._stop_requested = False
+        self._last_sample_ts = None
+        self._dropped_frames = 0
+        self._row_file = None
+        self.rgb_image_format = str(DEMO_RECORD_RGB_DEFAULT_FORMAT).lower()
+        self.rgb_jpeg_quality = int(DEMO_RECORD_RGB_JPEG_QUALITY)
+
+    def _ensure(self, p: Path):
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    def _next_episode_index(self, root: Path):
+        episodes_meta = root / "meta" / "episodes.jsonl"
+        if not episodes_meta.exists():
+            return 0
+        idx = -1
+        with open(episodes_meta, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                    idx = max(idx, int(rec.get("episode_index", -1)))
+                except Exception:
+                    continue
+        return idx + 1
+
+    def _depth_preview_rgb(self, depth_m):
+        depth = np.array(depth_m, dtype=np.float32)
+        depth = np.nan_to_num(depth, nan=0.0, posinf=0.0, neginf=0.0)
+        depth = np.clip(depth, 0.0, 3.0)
+        depth_u8 = (depth / 3.0 * 255.0).astype(np.uint8)
+        color = cv2.applyColorMap(depth_u8, cv2.COLORMAP_TURBO)
+        return cv2.cvtColor(color, cv2.COLOR_BGR2RGB)
+
+    def start(
+        self,
+        dataset_root: str,
+        prompt: str,
+        *,
+        rgb_image_format: str = DEMO_RECORD_RGB_DEFAULT_FORMAT,
+        rgb_jpeg_quality: int = DEMO_RECORD_RGB_JPEG_QUALITY,
+    ):
+        root = Path(dataset_root).expanduser().resolve()
+        self.root = root
+        self.prompt = (prompt or "").strip()
+        fmt = str(rgb_image_format or DEMO_RECORD_RGB_DEFAULT_FORMAT).strip().lower()
+        if fmt == "jpeg":
+            fmt = "jpg"
+        if fmt not in {"jpg", "png"}:
+            fmt = str(DEMO_RECORD_RGB_DEFAULT_FORMAT).lower()
+        self.rgb_image_format = fmt
+        q = int(rgb_jpeg_quality) if isinstance(rgb_jpeg_quality, (int, float)) else int(DEMO_RECORD_RGB_JPEG_QUALITY)
+        self.rgb_jpeg_quality = int(max(60, min(100, q)))
+        self.episode_index = self._next_episode_index(root)
+        self.chunk_name = f"chunk-{self.episode_index // 1000:03d}"
+        self.episode_name = f"episode_{self.episode_index:06d}"
+        self.frame_index = 0
+        self.start_wall_time = time.time()
+        self.writers = {}
+        self._last_sample_ts = None
+        self._dropped_frames = 0
+        self._stop_requested = False
+
+        meta_dir = self._ensure(root / "meta")
+        data_dir = self._ensure(root / "data" / self.chunk_name)
+        images_dir = self._ensure(root / "images" / self.chunk_name)
+        prompts_dir = self._ensure(root / "prompts" / self.chunk_name)
+        depth_dir = self._ensure(root / "depth" / self.chunk_name)
+
+        self.paths = {
+            "meta_dir": meta_dir,
+            "data_file_jsonl": data_dir / f"{self.episode_name}.jsonl",
+            "prompt_file": prompts_dir / f"{self.episode_name}.txt",
+            "head_rgb_frames": self._ensure(images_dir / "observation.images.head_rgb" / self.episode_name),
+            "wrist_rgb_frames": self._ensure(images_dir / "observation.images.wrist_rgb" / self.episode_name),
+            # Depth preview images are intentionally disabled to reduce recorder I/O load.
+            # Keep JSON keys, but write them as null in rows.
+            # "head_depth_preview_frames": self._ensure(images_dir / "observation.images.head_depth" / self.episode_name),
+            # "wrist_depth_preview_frames": self._ensure(images_dir / "observation.images.wrist_depth" / self.episode_name),
+            "head_depth_frames": self._ensure(depth_dir / "observation.depth.head" / self.episode_name),
+            "wrist_depth_frames": self._ensure(depth_dir / "observation.depth.wrist" / self.episode_name),
+        }
+
+        with open(self.paths["prompt_file"], "w", encoding="utf-8") as f:
+            f.write(self.prompt + "\n")
+
+        self._row_file = open(self.paths["data_file_jsonl"], "w", encoding="utf-8", buffering=1)
+        self._writer_thread = threading.Thread(target=self._writer_loop, daemon=True)
+        self._writer_thread.start()
+        self.active = True
+
+    def _rel(self, p: Path):
+        return str(p.relative_to(self.root))
+
+    def record_step(self, sample: dict):
+        if not self.active:
+            return
+
+        ts_abs = float(sample.get("timestamp", time.time()))
+        if self._last_sample_ts is not None:
+            min_dt = 1.0 / max(1e-6, self.target_fps)
+            if (ts_abs - self._last_sample_ts) < min_dt:
+                return
+        self._last_sample_ts = ts_abs
+
+        try:
+            self._sample_queue.put_nowait(sample)
+        except queue.Full:
+            self._dropped_frames += 1
+
+    def _process_step(self, sample: dict):
+        ts_abs = float(sample.get("timestamp", time.time()))
+        ts_rel = ts_abs - self.start_wall_time
+
+        head_rgb = sample.get("head_rgb")
+        wrist_rgb = sample.get("wrist_rgb")
+        head_depth = sample.get("head_depth")
+        wrist_depth = sample.get("wrist_depth")
+        rgb_ext = ".jpg" if self.rgb_image_format == "jpg" else ".png"
+
+        head_rgb_png_rel = None
+        if head_rgb is not None:
+            head_rgb_path = self.paths["head_rgb_frames"] / f"frame_{self.frame_index:06d}{rgb_ext}"
+            head_bgr = cv2.cvtColor(head_rgb, cv2.COLOR_RGB2BGR)
+            if self.rgb_image_format == "jpg":
+                ok = cv2.imwrite(
+                    str(head_rgb_path),
+                    head_bgr,
+                    [int(cv2.IMWRITE_JPEG_QUALITY), int(self.rgb_jpeg_quality)],
+                )
+            else:
+                ok = cv2.imwrite(str(head_rgb_path), head_bgr)
+            if ok:
+                head_rgb_png_rel = self._rel(head_rgb_path)
+
+        wrist_rgb_png_rel = None
+        if wrist_rgb is not None:
+            wrist_rgb_path = self.paths["wrist_rgb_frames"] / f"frame_{self.frame_index:06d}{rgb_ext}"
+            wrist_rgb = adjust_gamma(wrist_rgb, 2.5)
+            wrist_bgr = cv2.cvtColor(wrist_rgb, cv2.COLOR_RGB2BGR)
+            if self.rgb_image_format == "jpg":
+                ok = cv2.imwrite(
+                    str(wrist_rgb_path),
+                    wrist_bgr,
+                    [int(cv2.IMWRITE_JPEG_QUALITY), int(self.rgb_jpeg_quality)],
+                )
+            else:
+                ok = cv2.imwrite(str(wrist_rgb_path), wrist_bgr)
+            if ok:
+                wrist_rgb_png_rel = self._rel(wrist_rgb_path)
+
+        head_depth_png_rel = None
+        head_depth_preview_png_rel = None
+        if head_depth is not None:
+            # Depth preview generation/write disabled for faster recording.
+            # head_depth_rgb = self._depth_preview_rgb(head_depth)
+            # head_depth_preview_png = self.paths["head_depth_preview_frames"] / f"frame_{self.frame_index:06d}.png"
+            # cv2.imwrite(str(head_depth_preview_png), cv2.cvtColor(head_depth_rgb, cv2.COLOR_RGB2BGR))
+            # head_depth_preview_png_rel = self._rel(head_depth_preview_png)
+            depth_mm = np.clip(np.array(head_depth, dtype=np.float32) * 1000.0, 0, 65535).astype(np.uint16)
+            depth_png = self.paths["head_depth_frames"] / f"frame_{self.frame_index:06d}.png"
+            cv2.imwrite(str(depth_png), depth_mm)
+            head_depth_png_rel = self._rel(depth_png)
+
+        wrist_depth_png_rel = None
+        wrist_depth_preview_png_rel = None
+        if wrist_depth is not None:
+            # Depth preview generation/write disabled for faster recording.
+            # wrist_depth_rgb = self._depth_preview_rgb(wrist_depth)
+            # wrist_depth_preview_png = self.paths["wrist_depth_preview_frames"] / f"frame_{self.frame_index:06d}.png"
+            # cv2.imwrite(str(wrist_depth_preview_png), cv2.cvtColor(wrist_depth_rgb, cv2.COLOR_RGB2BGR))
+            # wrist_depth_preview_png_rel = self._rel(wrist_depth_preview_png)
+            depth_mm = np.clip(np.array(wrist_depth, dtype=np.float32) * 1000.0, 0, 65535).astype(np.uint16)
+            depth_png = self.paths["wrist_depth_frames"] / f"frame_{self.frame_index:06d}.png"
+            cv2.imwrite(str(depth_png), depth_mm)
+            wrist_depth_png_rel = self._rel(depth_png)
+
+        row = {
+            "episode_index": int(self.episode_index),
+            "frame_index": int(self.frame_index),
+            "timestamp": ts_abs,
+            "timestamp_sec": ts_rel,
+            "task": self.prompt,
+            "observation.state": _to_jsonable(sample.get("state", [])),
+            "action": _to_jsonable(sample.get("action", [])),
+            "action_command": _to_jsonable(sample.get("action_command", [])),
+            "observation.images.head_rgb": head_rgb_png_rel,
+            "observation.images.wrist_rgb": wrist_rgb_png_rel,
+            "observation.images.head_depth": head_depth_preview_png_rel,
+            "observation.images.wrist_depth": wrist_depth_preview_png_rel,
+            "observation.depth.head_frame": head_depth_png_rel,
+            "observation.depth.wrist_frame": wrist_depth_png_rel,
+        }
+        sensors = _to_jsonable(sample.get("sensors", {}))
+        for k, v in sensors.items():
+            row[k] = v
+
+        if self._row_file is not None:
+            self._row_file.write(json.dumps(_to_jsonable(row), ensure_ascii=True) + "\n")
+        self.frame_index += 1
+
+    def _writer_loop(self):
+        while True:
+            if self._stop_requested and self._sample_queue.empty():
+                break
+            try:
+                sample = self._sample_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if sample is None:
+                self._sample_queue.task_done()
+                break
+            try:
+                self._process_step(sample)
+            except Exception as e:
+                print(f"Recorder worker error: {e}")
+            finally:
+                self._sample_queue.task_done()
+
+        if self._row_file is not None:
+            try:
+                self._row_file.flush()
+                self._row_file.close()
+            except Exception:
+                pass
+            self._row_file = None
+
+    def _append_jsonl(self, path: Path, obj: dict):
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(_to_jsonable(obj), ensure_ascii=True) + "\n")
+
+    @staticmethod
+    def _safe_unlink(path: Path) -> None:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+
+    @staticmethod
+    def _safe_rmtree(path: Path) -> None:
+        try:
+            shutil.rmtree(path, ignore_errors=True)
+        except Exception:
+            pass
+
+    def _prune_empty_parent(self, start_path: Path) -> None:
+        stop_at = Path(self.root) if self.root is not None else None
+        cur = start_path
+        while True:
+            if stop_at is not None and cur == stop_at:
+                break
+            try:
+                cur.rmdir()
+            except OSError:
+                break
+            except Exception:
+                break
+            parent = cur.parent
+            if parent == cur:
+                break
+            cur = parent
+
+    def _discard_episode_files(self) -> None:
+        data_file = self.paths.get("data_file_jsonl")
+        prompt_file = self.paths.get("prompt_file")
+        if isinstance(data_file, Path):
+            self._safe_unlink(data_file)
+            self._prune_empty_parent(data_file.parent)
+        if isinstance(prompt_file, Path):
+            self._safe_unlink(prompt_file)
+            self._prune_empty_parent(prompt_file.parent)
+
+        for key in ("head_rgb_frames", "wrist_rgb_frames", "head_depth_frames", "wrist_depth_frames"):
+            p = self.paths.get(key)
+            if isinstance(p, Path):
+                self._safe_rmtree(p)
+                self._prune_empty_parent(p.parent)
+
+    def stop(self, *, discard: bool = False):
+        if not self.active:
+            return None
+
+        self.active = False
+        self._stop_requested = True
+        try:
+            self._sample_queue.put_nowait(None)
+        except Exception:
+            pass
+        if self._writer_thread is not None:
+            self._writer_thread.join(timeout=10.0)
+            self._writer_thread = None
+
+        if discard:
+            self._discard_episode_files()
+            summary = {
+                "episode_index": int(self.episode_index),
+                "num_frames": int(self.frame_index),
+                "data_format": self.data_format,
+                "dataset_root": str(self.root),
+                "task": self.prompt,
+                "dropped_frames": int(self._dropped_frames),
+                "discarded": True,
+            }
+            self._sample_queue = queue.Queue(maxsize=self.queue_maxsize)
+            return summary
+
+        data_rel = self._rel(self.paths["data_file_jsonl"])
+        data_format = "jsonl"
+
+        meta_dir = self.paths["meta_dir"]
+        episodes_path = meta_dir / "episodes.jsonl"
+        tasks_path = meta_dir / "tasks.jsonl"
+        info_path = meta_dir / "info.json"
+
+        ep_meta = {
+            "episode_index": int(self.episode_index),
+            "episode_name": self.episode_name,
+            "length": int(self.frame_index),
+            "task": self.prompt,
+            "data_path": data_rel,
+            "images": {
+                "head_rgb": self._rel(self.paths["head_rgb_frames"]),
+                "wrist_rgb": self._rel(self.paths["wrist_rgb_frames"]),
+                # Preview depth image streams are disabled.
+                "head_depth": None,
+                "wrist_depth": None,
+            },
+            "prompt_path": self._rel(self.paths["prompt_file"]),
+            "created_at": time.time(),
+            "tabular_format": data_format,
+            "dropped_frames": int(self._dropped_frames),
+        }
+        self._append_jsonl(episodes_path, ep_meta)
+        self._append_jsonl(tasks_path, {
+            "episode_index": int(self.episode_index),
+            "task": self.prompt,
+        })
+
+        info = {}
+        if info_path.exists():
+            try:
+                info = json.loads(info_path.read_text(encoding="utf-8"))
+            except Exception:
+                info = {}
+        total_episodes = int(info.get("total_episodes", 0)) + 1
+        total_frames = int(info.get("total_frames", 0)) + int(self.frame_index)
+        info.update({
+            "dataset_type": "lerobot_style",
+            "codebase_version": "v2.1_style",
+            "robot_type": self.robot_type,
+            "total_episodes": total_episodes,
+            "total_frames": total_frames,
+            "fps": self.target_fps,
+            "rgb_storage": f"{self.rgb_image_format}_frames",
+            "depth_preview_storage": "disabled",
+            "tabular_format": data_format,
+            "last_episode_dropped_frames": int(self._dropped_frames),
+            "features": [
+                "observation.images.head_rgb",
+                "observation.images.wrist_rgb",
+                "observation.images.head_depth",
+                "observation.images.wrist_depth",
+                "observation.depth.head_frame",
+                "observation.depth.wrist_frame",
+                "observation.state",
+                "action",
+                "sensors.*",
+                "task",
+            ],
+        })
+        info_path.write_text(json.dumps(info, indent=2), encoding="utf-8")
+
+        summary = {
+            "episode_index": int(self.episode_index),
+            "num_frames": int(self.frame_index),
+            "data_format": data_format,
+            "dataset_root": str(self.root),
+            "task": self.prompt,
+            "dropped_frames": int(self._dropped_frames),
+        }
+
+        self._sample_queue = queue.Queue(maxsize=self.queue_maxsize)
+        return summary
+
+
+###############################################################################
+# stretch_ai worker RPC
+###############################################################################
+class _StretchAIWorkerRPC:
+    def __init__(self, cmd: list[str], *, env: dict[str, str], cwd: str | None = None):
+        self._cmd = cmd
+        self._env = env
+        self._cwd = cwd
+        self._proc: subprocess.Popen[Any] | None = None
+        self._resp_queue: queue.Queue[dict[str, Any]] = queue.Queue()
+        self._stdout_thread: threading.Thread | None = None
+        self._stderr_thread: threading.Thread | None = None
+        self._req_lock = threading.Lock()
+        self._next_id = 1
+
+    def start(self) -> None:
+        if self._proc is not None:
+            return
+        self._proc = subprocess.Popen(
+            self._cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            cwd=self._cwd,
+            env=self._env,
+        )
+        if self._proc.stdin is None or self._proc.stdout is None or self._proc.stderr is None:
+            raise RuntimeError("Failed to create pipes for stretch_ai worker process")
+        self._stdout_thread = threading.Thread(target=self._stdout_loop, daemon=True)
+        self._stderr_thread = threading.Thread(target=self._stderr_loop, daemon=True)
+        self._stdout_thread.start()
+        self._stderr_thread.start()
+
+    def _stdout_loop(self) -> None:
+        assert self._proc is not None and self._proc.stdout is not None
+        for line in self._proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                parsed = json.loads(line)
+                # Worker responses are JSON objects. Ignore array/scalar JSON logs
+                # emitted by dependencies so they do not break request matching.
+                if isinstance(parsed, dict):
+                    self._resp_queue.put(parsed)
+                else:
+                    print(f"[stretch_ai_worker] Ignoring non-object JSON stdout: {line}", file=sys.stderr)
+            except Exception:
+                # Treat arbitrary stdout text as log output; do not poison the RPC queue.
+                print(f"[stretch_ai_worker] Ignoring non-JSON stdout: {line}", file=sys.stderr)
+
+    def _stderr_loop(self) -> None:
+        assert self._proc is not None and self._proc.stderr is not None
+        for line in self._proc.stderr:
+            msg = line.rstrip()
+            if msg:
+                print(f"[stretch_ai_worker] {msg}", file=sys.stderr)
+
+    def request(self, method: str, params: dict[str, Any] | None = None, *, timeout_s: float) -> dict[str, Any]:
+        if self._proc is None:
+            raise RuntimeError("stretch_ai worker process is not started")
+        if self._proc.poll() is not None:
+            raise RuntimeError(f"stretch_ai worker exited with code {self._proc.returncode}")
+        if self._proc.stdin is None:
+            raise RuntimeError("stretch_ai worker stdin is unavailable")
+
+        with self._req_lock:
+            req_id = self._next_id
+            self._next_id += 1
+            payload = {"id": req_id, "method": method, "params": params or {}}
+            self._proc.stdin.write(json.dumps(payload, separators=(",", ":")) + "\n")
+            self._proc.stdin.flush()
+
+            deadline = time.time() + float(timeout_s)
+            while True:
+                if self._proc.poll() is not None:
+                    raise RuntimeError(
+                        f"stretch_ai worker exited with code {self._proc.returncode} during {method!r}"
+                    )
+                remaining = max(0.0, deadline - time.time())
+                if remaining <= 0.0:
+                    raise TimeoutError(f"Timeout waiting for worker response to {method!r}")
+                try:
+                    resp = self._resp_queue.get(timeout=remaining)
+                except queue.Empty as exc:
+                    if self._proc.poll() is not None:
+                        raise RuntimeError(
+                            f"stretch_ai worker exited with code {self._proc.returncode} during {method!r}"
+                        ) from exc
+                    raise TimeoutError(f"Timeout waiting for worker response to {method!r}") from exc
+                if not isinstance(resp, dict):
+                    continue
+                if resp.get("id") != req_id:
+                    continue
+                if not resp.get("ok", False):
+                    tb = resp.get("traceback")
+                    msg = str(resp.get("error", "Unknown worker error"))
+                    if tb:
+                        msg = f"{msg}\n{tb}"
+                    raise RuntimeError(msg)
+                return resp.get("result", {})
+
+    def close(self) -> None:
+        proc = self._proc
+        if proc is None:
+            return
+        try:
+            if proc.poll() is None:
+                try:
+                    self.request("close", {}, timeout_s=2.0)
+                except Exception:
+                    pass
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3.0)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+            self._proc = None
+
+
+###############################################################################
+# Bridge backend
+###############################################################################
+class _DummyNow:
+    def to_msg(self):
+        sec = int(time.time())
+        nanosec = int((time.time() - sec) * 1e9)
+        return {"sec": sec, "nanosec": nanosec}
+
+
+class _DummyClock:
+    def now(self):
+        return _DummyNow()
+
+
+class _CameraInfoCompat:
+    def __init__(self, raw: dict[str, Any]):
+        self.width = int(raw.get("width", 0))
+        self.height = int(raw.get("height", 0))
+        self.k = [float(v) for v in (raw.get("k") or [0.0] * 9)]
+        self.d = [float(v) for v in (raw.get("d") or [])]
+        self.r = [float(v) for v in (raw.get("r") or [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0])]
+        self.p = [float(v) for v in (raw.get("p") or [0.0] * 12)]
+        self.distortion_model = str(raw.get("distortion_model", "plumb_bob"))
+
+
+def _quat_xyzw_to_rotmat(q_xyzw: np.ndarray) -> np.ndarray:
+    q = np.asarray(q_xyzw, dtype=np.float64).reshape(-1)
+    if q.shape[0] < 4:
+        return np.eye(3, dtype=np.float64)
+    x, y, z, w = q[:4]
+    n = float(np.sqrt(x * x + y * y + z * z + w * w))
+    if n <= 1e-12:
+        return np.eye(3, dtype=np.float64)
+    x, y, z, w = x / n, y / n, z / n, w / n
+    return np.array(
+        [
+            [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
+            [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
+            [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
+        ],
+        dtype=np.float64,
+    )
+
+
+def _transform_dict_to_msg(tf: dict[str, Any]):
+    t = tf.get("translation") or [0.0, 0.0, 0.0]
+    q = tf.get("rotation") or [0.0, 0.0, 0.0, 1.0]
+    return types.SimpleNamespace(
+        header=types.SimpleNamespace(
+            frame_id=str(tf.get("target_frame", "")),
+            stamp={"sec": int(time.time()), "nanosec": 0},
+        ),
+        child_frame_id=str(tf.get("source_frame", "")),
+        transform=types.SimpleNamespace(
+            translation=types.SimpleNamespace(x=float(t[0]), y=float(t[1]), z=float(t[2])),
+            rotation=types.SimpleNamespace(x=float(q[0]), y=float(q[1]), z=float(q[2]), w=float(q[3])),
+        ),
+    )
+
+
+def _apply_transform_point(point_stamped: PointStamped, tf_msg) -> PointStamped:
+    q = np.array(
+        [
+            float(tf_msg.transform.rotation.x),
+            float(tf_msg.transform.rotation.y),
+            float(tf_msg.transform.rotation.z),
+            float(tf_msg.transform.rotation.w),
+        ],
+        dtype=np.float64,
+    )
+    r = _quat_xyzw_to_rotmat(q)
+    t = np.array(
+        [
+            float(tf_msg.transform.translation.x),
+            float(tf_msg.transform.translation.y),
+            float(tf_msg.transform.translation.z),
+        ],
+        dtype=np.float64,
+    )
+    p = np.array([float(point_stamped.point.x), float(point_stamped.point.y), float(point_stamped.point.z)])
+    out = PointStamped()
+    out.header.frame_id = str(tf_msg.header.frame_id)
+    out.header.stamp = point_stamped.header.stamp
+    p_out = r @ p + t
+    out.point.x = float(p_out[0])
+    out.point.y = float(p_out[1])
+    out.point.z = float(p_out[2])
+    return out
+
+
+class _BridgeTFBuffer:
+    def __init__(self, bridge: "StretchAIDemoBridge"):
+        self._bridge = bridge
+
+    def lookup_transform(self, target_frame: str, source_frame: str, *args, **kwargs):
+        return self._bridge.lookup_transform(target_frame, source_frame, *args, **kwargs)
+
+
+class RosTopicObservationNode(Node):
+    """ROS2 subscriber node for observation-only data path."""
+
+    def __init__(self):
+        super().__init__("stretch_obs_v8_2mode")
+        self._lock = threading.Lock()
+        self._bridge = CvBridge()
+        self._prefer_cv_bridge = True
+        self._last_cb_error_t = 0.0
+
+        self.head_rgb: np.ndarray | None = None
+        self.wrist_rgb: np.ndarray | None = None
+        self.head_depth: np.ndarray | None = None
+        self.wrist_depth: np.ndarray | None = None
+        self.head_info: dict[str, Any] | None = None
+        self.wrist_info: dict[str, Any] | None = None
+
+        self.actual_qpos: list[float] | None = None
+        self.base_pose_xytheta: list[float] | None = None
+        self.joint_state_name: list[str] = []
+        self.joint_state_position: list[float] = []
+        self.joint_state_velocity: list[float] = []
+        self.joint_state_effort: list[float] = []
+        self.imu_mobile: dict[str, Any] | None = None
+        self.imu_wrist: dict[str, Any] | None = None
+        self.imu_cam_accel: dict[str, Any] | None = None
+        self.imu_cam_gyro: dict[str, Any] | None = None
+        self.mag_mobile: dict[str, Any] | None = None
+        self.battery: dict[str, Any] | None = None
+        self.odom: dict[str, Any] | None = None
+        self._base_lin = 0.0
+        self._base_ang = 0.0
+        self._stamp_ns: dict[str, int | None] = {
+            "head_rgb": None,
+            "wrist_rgb": None,
+            "head_depth": None,
+            "wrist_depth": None,
+            "joint_state": None,
+            "odom": None,
+            "head_info": None,
+            "wrist_info": None,
+        }
+        self._recv_wall_ns: dict[str, int | None] = {k: None for k in self._stamp_ns}
+        self._ros_minus_wall_ns: int | None = None
+        self._joint_hist: deque[tuple[int, list[float]]] = deque(maxlen=512)
+        self._base_pose_hist: deque[tuple[int, list[float]]] = deque(maxlen=512)
+
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+
+        sensor_qos = qos_profile_sensor_data
+        self.create_subscription(Image, HEAD_RGB_TOPIC, self._head_rgb_cb, sensor_qos)
+        self.create_subscription(Image, WRIST_RGB_TOPIC, self._wrist_rgb_cb, sensor_qos)
+        self.create_subscription(Image, HEAD_DEPTH_TOPIC, self._head_depth_cb, sensor_qos)
+        self.create_subscription(Image, WRIST_DEPTH_TOPIC, self._wrist_depth_cb, sensor_qos)
+        self.create_subscription(CameraInfo, HEAD_CAMERA_INFO_TOPIC, self._head_info_cb, sensor_qos)
+        self.create_subscription(CameraInfo, WRIST_CAMERA_INFO_TOPIC, self._wrist_info_cb, sensor_qos)
+        self.create_subscription(JointState, JOINT_STATE_TOPIC, self._joint_cb, sensor_qos)
+        self.create_subscription(Odometry, ODOM_TOPIC, self._odom_cb, sensor_qos)
+        self.create_subscription(Imu, IMU_MOBILE_BASE_TOPIC, self._imu_mobile_cb, sensor_qos)
+        self.create_subscription(Imu, IMU_WRIST_TOPIC, self._imu_wrist_cb, sensor_qos)
+        self.create_subscription(Imu, IMU_CAMERA_ACCEL_TOPIC, self._imu_cam_accel_cb, sensor_qos)
+        self.create_subscription(Imu, IMU_CAMERA_GYRO_TOPIC, self._imu_cam_gyro_cb, sensor_qos)
+        self.create_subscription(MagneticField, MAGNETOMETER_TOPIC, self._mag_cb, sensor_qos)
+        self.create_subscription(BatteryState, BATTERY_TOPIC, self._battery_cb, sensor_qos)
+
+    def _log_cb_error(self, cb_name: str, exc: Exception) -> None:
+        now = time.time()
+        if now - self._last_cb_error_t < 1.0:
+            return
+        self._last_cb_error_t = now
+        print(f"[ros_obs] callback {cb_name} error: {exc}", file=sys.stderr, flush=True)
+
+    @staticmethod
+    def _camera_info_dict(msg: CameraInfo) -> dict[str, Any]:
+        return {
+            "width": int(msg.width),
+            "height": int(msg.height),
+            "k": [float(v) for v in msg.k],
+            "d": [float(v) for v in msg.d],
+            "r": [float(v) for v in msg.r],
+            "p": [float(v) for v in msg.p],
+            "distortion_model": str(msg.distortion_model),
+        }
+
+    @staticmethod
+    def _imu_to_dict(msg: Imu) -> dict[str, Any]:
+        return {
+            "orientation": [
+                float(msg.orientation.x),
+                float(msg.orientation.y),
+                float(msg.orientation.z),
+                float(msg.orientation.w),
+            ],
+            "angular_velocity": [
+                float(msg.angular_velocity.x),
+                float(msg.angular_velocity.y),
+                float(msg.angular_velocity.z),
+            ],
+            "linear_acceleration": [
+                float(msg.linear_acceleration.x),
+                float(msg.linear_acceleration.y),
+                float(msg.linear_acceleration.z),
+            ],
+        }
+
+    @staticmethod
+    def _mag_to_dict(msg: MagneticField) -> dict[str, Any]:
+        return {
+            "magnetic_field": [
+                float(msg.magnetic_field.x),
+                float(msg.magnetic_field.y),
+                float(msg.magnetic_field.z),
+            ]
+        }
+
+    @staticmethod
+    def _battery_to_dict(msg: BatteryState) -> dict[str, Any]:
+        return {
+            "voltage": float(msg.voltage),
+            "current": float(msg.current),
+            "charge": float(msg.charge),
+            "capacity": float(msg.capacity),
+            "percentage": float(msg.percentage),
+            "power_supply_status": int(msg.power_supply_status),
+            "power_supply_health": int(msg.power_supply_health),
+            "power_supply_technology": int(msg.power_supply_technology),
+            "present": bool(msg.present),
+        }
+
+    @staticmethod
+    def _msg_stamp_ns(msg: Any) -> int | None:
+        try:
+            hdr = getattr(msg, "header", None)
+            st = getattr(hdr, "stamp", None)
+            sec = int(getattr(st, "sec"))
+            nsec = int(getattr(st, "nanosec"))
+            if sec < 0 or nsec < 0:
+                return None
+            return sec * 1_000_000_000 + nsec
+        except Exception:
+            return None
+
+    def _update_stream_stamp(self, key: str, msg: Any, *, recv_wall_ns: int | None = None) -> int | None:
+        stamp_ns = self._msg_stamp_ns(msg)
+        if recv_wall_ns is None:
+            recv_wall_ns = time.time_ns()
+        with self._lock:
+            self._stamp_ns[key] = stamp_ns
+            self._recv_wall_ns[key] = int(recv_wall_ns)
+            if stamp_ns is not None:
+                self._ros_minus_wall_ns = int(stamp_ns - int(recv_wall_ns))
+        return stamp_ns
+
+    @staticmethod
+    def _history_at_or_before(
+        history: deque[tuple[int, list[float]]],
+        ref_stamp_ns: int | None,
+    ) -> tuple[list[float] | None, int | None]:
+        if ref_stamp_ns is None or len(history) == 0:
+            if len(history) == 0:
+                return None, None
+            ts, val = history[-1]
+            return list(val), int(ts)
+        ref = int(ref_stamp_ns)
+        for ts, val in reversed(history):
+            if int(ts) <= ref:
+                return list(val), int(ts)
+        ts, val = history[0]
+        return list(val), int(ts)
+
+    @staticmethod
+    def _extract_qpos(msg: JointState, *, base_lin: float, base_ang: float) -> list[float] | None:
+        try:
+            idx = {str(name): i for i, name in enumerate(msg.name)}
+            arm_lift = float(msg.position[idx["joint_lift"]])
+            arm_extension = float(4.0 * msg.position[idx["joint_arm_l0"]])
+            wrist_yaw = float(msg.position[idx["joint_wrist_yaw"]])
+            wrist_pitch = float(msg.position[idx["joint_wrist_pitch"]])
+            wrist_roll = float(msg.position[idx["joint_wrist_roll"]])
+            head_pan = float(msg.position[idx["joint_head_pan"]])
+            head_tilt = float(msg.position[idx["joint_head_tilt"]])
+            gripper = float(msg.position[idx["joint_gripper_finger_left"]])
+        except Exception:
+            return None
+
+        return [
+            arm_extension,
+            arm_lift,
+            wrist_yaw,
+            wrist_pitch,
+            wrist_roll,
+            head_pan,
+            head_tilt,
+            gripper,
+            float(base_lin),
+            float(base_ang),
+        ]
+
+    @staticmethod
+    def _decode_raw_image_rgb(msg: Image) -> np.ndarray | None:
+        try:
+            width = int(msg.width)
+            height = int(msg.height)
+            step = int(msg.step)
+            encoding = str(msg.encoding).lower()
+            is_big = int(msg.is_bigendian)
+            _ = is_big
+        except Exception:
+            return None
+        if width <= 0 or height <= 0:
+            return None
+        try:
+            buf = np.frombuffer(bytes(msg.data), dtype=np.uint8)
+        except Exception:
+            return None
+
+        def _reshape(bytes_per_pixel: int) -> np.ndarray | None:
+            row_stride = step if step > 0 else width * bytes_per_pixel
+            expected = row_stride * height
+            if buf.size < expected:
+                return None
+            raw = buf[:expected].reshape(height, row_stride)
+            return raw[:, : width * bytes_per_pixel].reshape(height, width, bytes_per_pixel)
+
+        if encoding == "rgb8":
+            arr = _reshape(3)
+            return None if arr is None else arr.copy()
+        if encoding == "bgr8":
+            arr = _reshape(3)
+            return None if arr is None else cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
+        if encoding == "rgba8":
+            arr = _reshape(4)
+            return None if arr is None else cv2.cvtColor(arr, cv2.COLOR_RGBA2RGB)
+        if encoding == "bgra8":
+            arr = _reshape(4)
+            return None if arr is None else cv2.cvtColor(arr, cv2.COLOR_BGRA2RGB)
+        if encoding in {"mono8", "8uc1"}:
+            arr = _reshape(1)
+            if arr is None:
+                return None
+            return cv2.cvtColor(arr[..., 0], cv2.COLOR_GRAY2RGB)
+        return None
+
+    @staticmethod
+    def _decode_raw_depth_m(msg: Image) -> np.ndarray | None:
+        try:
+            width = int(msg.width)
+            height = int(msg.height)
+            step = int(msg.step)
+            encoding = str(msg.encoding).lower()
+            is_big = int(msg.is_bigendian)
+        except Exception:
+            return None
+        if width <= 0 or height <= 0:
+            return None
+        try:
+            buf = np.frombuffer(bytes(msg.data), dtype=np.uint8)
+        except Exception:
+            return None
+
+        if encoding in {"16uc1", "mono16"}:
+            bpp = 2
+            row_stride = step if step > 0 else width * bpp
+            expected = row_stride * height
+            if buf.size < expected:
+                return None
+            raw = buf[:expected].reshape(height, row_stride)
+            pix = raw[:, : width * bpp]
+            dtype = np.dtype(">u2") if is_big else np.dtype("<u2")
+            depth_u16 = pix.view(dtype).reshape(height, width)
+            return depth_u16.astype(np.float32) / 1000.0
+
+        if encoding in {"32fc1"}:
+            bpp = 4
+            row_stride = step if step > 0 else width * bpp
+            expected = row_stride * height
+            if buf.size < expected:
+                return None
+            raw = buf[:expected].reshape(height, row_stride)
+            pix = raw[:, : width * bpp]
+            dtype = np.dtype(">f4") if is_big else np.dtype("<f4")
+            depth_f32 = pix.view(dtype).reshape(height, width).astype(np.float32)
+            depth_f32[~np.isfinite(depth_f32)] = 0.0
+            return depth_f32
+
+        return None
+
+    def _head_rgb_cb(self, msg: Image) -> None:
+        recv_wall_ns = time.time_ns()
+        rgb = None
+        if self._prefer_cv_bridge:
+            try:
+                rgb = self._bridge.imgmsg_to_cv2(msg, desired_encoding="rgb8").copy()
+            except Exception as exc:
+                self._prefer_cv_bridge = False
+                self._log_cb_error("head_rgb(cv_bridge)", exc)
+        if rgb is None:
+            rgb = self._decode_raw_image_rgb(msg)
+        if rgb is None:
+            return
+        if ROS_TOPICS_ROTATE_HEAD_90_CW:
+            rgb = cv2.rotate(rgb, cv2.ROTATE_90_CLOCKWISE)
+        self._update_stream_stamp("head_rgb", msg, recv_wall_ns=recv_wall_ns)
+        with self._lock:
+            self.head_rgb = rgb
+
+    def _wrist_rgb_cb(self, msg: Image) -> None:
+        recv_wall_ns = time.time_ns()
+        rgb = None
+        if self._prefer_cv_bridge:
+            try:
+                rgb = self._bridge.imgmsg_to_cv2(msg, desired_encoding="rgb8").copy()
+            except Exception as exc:
+                self._prefer_cv_bridge = False
+                self._log_cb_error("wrist_rgb(cv_bridge)", exc)
+        if rgb is None:
+            rgb = self._decode_raw_image_rgb(msg)
+        if rgb is None:
+            return
+        self._update_stream_stamp("wrist_rgb", msg, recv_wall_ns=recv_wall_ns)
+        with self._lock:
+            self.wrist_rgb = rgb
+
+    def _head_depth_cb(self, msg: Image) -> None:
+        recv_wall_ns = time.time_ns()
+        depth = None
+        if self._prefer_cv_bridge:
+            try:
+                depth = self._bridge.imgmsg_to_cv2(msg, desired_encoding="passthrough")
+                if depth is not None:
+                    depth = np.asarray(depth)
+                    if depth.dtype == np.uint16:
+                        depth = depth.astype(np.float32) / 1000.0
+                    else:
+                        depth = depth.astype(np.float32)
+            except Exception as exc:
+                self._prefer_cv_bridge = False
+                self._log_cb_error("head_depth(cv_bridge)", exc)
+        if depth is None:
+            depth = self._decode_raw_depth_m(msg)
+        if depth is None:
+            return
+        if ROS_TOPICS_ROTATE_HEAD_90_CW:
+            depth = cv2.rotate(depth, cv2.ROTATE_90_CLOCKWISE)
+        self._update_stream_stamp("head_depth", msg, recv_wall_ns=recv_wall_ns)
+        with self._lock:
+            self.head_depth = depth
+
+    def _wrist_depth_cb(self, msg: Image) -> None:
+        recv_wall_ns = time.time_ns()
+        depth = None
+        if self._prefer_cv_bridge:
+            try:
+                depth = self._bridge.imgmsg_to_cv2(msg, desired_encoding="passthrough")
+                if depth is not None:
+                    depth = np.asarray(depth)
+                    if depth.dtype == np.uint16:
+                        depth = depth.astype(np.float32) / 1000.0
+                    else:
+                        depth = depth.astype(np.float32)
+            except Exception as exc:
+                self._prefer_cv_bridge = False
+                self._log_cb_error("wrist_depth(cv_bridge)", exc)
+        if depth is None:
+            depth = self._decode_raw_depth_m(msg)
+        if depth is None:
+            return
+        self._update_stream_stamp("wrist_depth", msg, recv_wall_ns=recv_wall_ns)
+        with self._lock:
+            self.wrist_depth = depth
+
+    def _head_info_cb(self, msg: CameraInfo) -> None:
+        try:
+            info = self._camera_info_dict(msg)
+            self._update_stream_stamp("head_info", msg)
+            with self._lock:
+                self.head_info = info
+        except Exception as exc:
+            self._log_cb_error("head_camera_info", exc)
+
+    def _wrist_info_cb(self, msg: CameraInfo) -> None:
+        try:
+            info = self._camera_info_dict(msg)
+            self._update_stream_stamp("wrist_info", msg)
+            with self._lock:
+                self.wrist_info = info
+        except Exception as exc:
+            self._log_cb_error("wrist_camera_info", exc)
+
+    def _joint_cb(self, msg: JointState) -> None:
+        try:
+            stamp_ns = self._update_stream_stamp("joint_state", msg)
+            with self._lock:
+                base_lin = float(self._base_lin)
+                base_ang = float(self._base_ang)
+            measured = self._extract_qpos(msg, base_lin=base_lin, base_ang=base_ang)
+            with self._lock:
+                self.joint_state_name = [str(v) for v in msg.name]
+                self.joint_state_position = [float(v) for v in msg.position]
+                self.joint_state_velocity = [float(v) for v in msg.velocity]
+                self.joint_state_effort = [float(v) for v in msg.effort]
+                if measured is not None:
+                    self.actual_qpos = measured
+                    if stamp_ns is not None:
+                        self._joint_hist.append((int(stamp_ns), list(measured)))
+        except Exception as exc:
+            self._log_cb_error("joint_state", exc)
+
+    def _odom_cb(self, msg: Odometry) -> None:
+        try:
+            stamp_ns = self._update_stream_stamp("odom", msg)
+            x = float(msg.pose.pose.position.x)
+            y = float(msg.pose.pose.position.y)
+            z = float(msg.pose.pose.position.z)
+            qx = float(msg.pose.pose.orientation.x)
+            qy = float(msg.pose.pose.orientation.y)
+            qz = float(msg.pose.pose.orientation.z)
+            qw = float(msg.pose.pose.orientation.w)
+            lin_x = float(msg.twist.twist.linear.x)
+            lin_y = float(msg.twist.twist.linear.y)
+            lin_z = float(msg.twist.twist.linear.z)
+            ang_x = float(msg.twist.twist.angular.x)
+            ang_y = float(msg.twist.twist.angular.y)
+            ang_z = float(msg.twist.twist.angular.z)
+            siny_cosp = 2.0 * (qw * qz + qx * qy)
+            cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz)
+            theta = float(np.arctan2(siny_cosp, cosy_cosp))
+            odom = {
+                "position": [x, y, z],
+                "orientation": [qx, qy, qz, qw],
+                "linear_velocity": [lin_x, lin_y, lin_z],
+                "angular_velocity": [ang_x, ang_y, ang_z],
+            }
+            with self._lock:
+                self.base_pose_xytheta = [x, y, theta]
+                self._base_lin = lin_x
+                self._base_ang = ang_z
+                self.odom = odom
+                if self.actual_qpos is not None and len(self.actual_qpos) >= 10:
+                    self.actual_qpos[8] = lin_x
+                    self.actual_qpos[9] = ang_z
+                if stamp_ns is not None:
+                    self._base_pose_hist.append((int(stamp_ns), [x, y, theta]))
+        except Exception as exc:
+            self._log_cb_error("odom", exc)
+
+    def _imu_mobile_cb(self, msg: Imu) -> None:
+        try:
+            with self._lock:
+                self.imu_mobile = self._imu_to_dict(msg)
+        except Exception as exc:
+            self._log_cb_error("imu_mobile", exc)
+
+    def _imu_wrist_cb(self, msg: Imu) -> None:
+        try:
+            with self._lock:
+                self.imu_wrist = self._imu_to_dict(msg)
+        except Exception as exc:
+            self._log_cb_error("imu_wrist", exc)
+
+    def _imu_cam_accel_cb(self, msg: Imu) -> None:
+        try:
+            with self._lock:
+                self.imu_cam_accel = self._imu_to_dict(msg)
+        except Exception as exc:
+            self._log_cb_error("imu_cam_accel", exc)
+
+    def _imu_cam_gyro_cb(self, msg: Imu) -> None:
+        try:
+            with self._lock:
+                self.imu_cam_gyro = self._imu_to_dict(msg)
+        except Exception as exc:
+            self._log_cb_error("imu_cam_gyro", exc)
+
+    def _mag_cb(self, msg: MagneticField) -> None:
+        try:
+            with self._lock:
+                self.mag_mobile = self._mag_to_dict(msg)
+        except Exception as exc:
+            self._log_cb_error("mag_mobile", exc)
+
+    def _battery_cb(self, msg: BatteryState) -> None:
+        try:
+            with self._lock:
+                self.battery = self._battery_to_dict(msg)
+        except Exception as exc:
+            self._log_cb_error("battery", exc)
+
+    def get_snapshot(self):
+        with self._lock:
+            hr = None if self.head_rgb is None else self.head_rgb.copy()
+            wr = None if self.wrist_rgb is None else self.wrist_rgb.copy()
+            hd = None if self.head_depth is None else self.head_depth.copy()
+            wd = None if self.wrist_depth is None else self.wrist_depth.copy()
+            hi = None if self.head_info is None else dict(self.head_info)
+            wi = None if self.wrist_info is None else dict(self.wrist_info)
+        return hr, wr, hd, wd, hi, wi
+
+    def get_observation_snapshot(self):
+        with self._lock:
+            return {
+                "actual_qpos": None if self.actual_qpos is None else list(self.actual_qpos),
+                "base_pose_xytheta": None if self.base_pose_xytheta is None else list(self.base_pose_xytheta),
+                "joint_state_name": list(self.joint_state_name),
+                "joint_state_position": list(self.joint_state_position),
+                "joint_state_velocity": list(self.joint_state_velocity),
+                "joint_state_effort": list(self.joint_state_effort),
+                "imu_mobile": None if self.imu_mobile is None else dict(self.imu_mobile),
+                "imu_wrist": None if self.imu_wrist is None else dict(self.imu_wrist),
+                "imu_cam_accel": None if self.imu_cam_accel is None else dict(self.imu_cam_accel),
+                "imu_cam_gyro": None if self.imu_cam_gyro is None else dict(self.imu_cam_gyro),
+                "mag_mobile": None if self.mag_mobile is None else dict(self.mag_mobile),
+                "battery": None if self.battery is None else dict(self.battery),
+                "odom": None if self.odom is None else dict(self.odom),
+                "stamp_ns": dict(self._stamp_ns),
+                "recv_wall_ns": dict(self._recv_wall_ns),
+                "ros_minus_wall_ns": self._ros_minus_wall_ns,
+            }
+
+    def get_timing_snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "stamp_ns": dict(self._stamp_ns),
+                "recv_wall_ns": dict(self._recv_wall_ns),
+                "ros_minus_wall_ns": self._ros_minus_wall_ns,
+            }
+
+    def get_aligned_observation_snapshot(self, reference_stamp_ns: int | None = None) -> dict[str, Any]:
+        with self._lock:
+            if reference_stamp_ns is None:
+                reference_stamp_ns = (
+                    self._stamp_ns.get("head_rgb")
+                    or self._stamp_ns.get("head_depth")
+                    or self._stamp_ns.get("wrist_rgb")
+                    or self._stamp_ns.get("wrist_depth")
+                )
+
+            aligned_qpos, joint_stamp_ns = self._history_at_or_before(self._joint_hist, reference_stamp_ns)
+            aligned_pose, odom_stamp_ns = self._history_at_or_before(self._base_pose_hist, reference_stamp_ns)
+            if aligned_qpos is None:
+                aligned_qpos = None if self.actual_qpos is None else list(self.actual_qpos)
+            if aligned_pose is None:
+                aligned_pose = None if self.base_pose_xytheta is None else list(self.base_pose_xytheta)
+
+            return {
+                "reference_stamp_ns": reference_stamp_ns,
+                "aligned_joint_stamp_ns": joint_stamp_ns,
+                "aligned_odom_stamp_ns": odom_stamp_ns,
+                "actual_qpos": aligned_qpos,
+                "base_pose_xytheta": aligned_pose,
+            }
+
+
+class RosTopicObservationClient:
+    """Threaded ROS2 observation client used when source is `ros_topic`."""
+
+    def __init__(self):
+        if _RCLPY_IMPORT_ERROR is not None:
+            raise RuntimeError(f"ROS2 imports unavailable: {_RCLPY_IMPORT_ERROR}")
+        self._node: RosTopicObservationNode | None = None
+        self._executor: MultiThreadedExecutor | None = None
+        self._spin_thread: threading.Thread | None = None
+        self._connected = False
+
+    @property
+    def connected(self) -> bool:
+        return bool(self._connected and self._node is not None)
+
+    def connect(self, timeout_s: float = ROS_TOPICS_CONNECT_TIMEOUT_S) -> None:
+        if self.connected:
+            return
+        if not hasattr(rclpy, "ok") or not rclpy.ok():
+            rclpy.init(args=None)
+
+        self._node = RosTopicObservationNode()
+        self._executor = MultiThreadedExecutor(num_threads=2)
+        self._executor.add_node(self._node)
+        self._spin_thread = threading.Thread(target=self._executor.spin, daemon=True)
+        self._spin_thread.start()
+
+        deadline = time.time() + float(timeout_s)
+        while time.time() < deadline:
+            if self._node is None:
+                break
+            hr, _, _, _, _, _ = self._node.get_snapshot()
+            obs = self._node.get_observation_snapshot()
+            aq = obs.get("actual_qpos")
+            if hr is not None and isinstance(aq, list) and len(aq) > 0:
+                self._connected = True
+                return
+            time.sleep(0.05)
+        self.close()
+        raise RuntimeError("Timed out waiting for ROS2 topic observations")
+
+    def get_snapshot(self):
+        if self._node is None:
+            return None, None, None, None, None, None
+        return self._node.get_snapshot()
+
+    def get_observation_snapshot(self) -> dict[str, Any]:
+        if self._node is None:
+            return {}
+        return self._node.get_observation_snapshot()
+
+    def get_timing_snapshot(self) -> dict[str, Any]:
+        if self._node is None:
+            return {}
+        return self._node.get_timing_snapshot()
+
+    def get_aligned_observation_snapshot(self, reference_stamp_ns: int | None = None) -> dict[str, Any]:
+        if self._node is None:
+            return {}
+        return self._node.get_aligned_observation_snapshot(reference_stamp_ns=reference_stamp_ns)
+
+    def lookup_transform(self, target_frame: str, source_frame: str, timeout_s: float = 1.0):
+        if self._node is None:
+            raise RuntimeError("ROS2 observation client not connected")
+        return self._node.tf_buffer.lookup_transform(
+            str(target_frame),
+            str(source_frame),
+            rclpy.time.Time(),
+            timeout=rclpy.duration.Duration(seconds=float(timeout_s)),
+        )
+
+    def get_clock(self):
+        if self._node is None:
+            return _DummyClock()
+        return self._node.get_clock()
+
+    def close(self) -> None:
+        self._connected = False
+        executor = self._executor
+        node = self._node
+        spin_thread = self._spin_thread
+        self._executor = None
+        self._node = None
+        self._spin_thread = None
+
+        if executor is not None:
+            try:
+                executor.shutdown(timeout_sec=1.0)
+            except Exception:
+                pass
+        if node is not None:
+            try:
+                node.destroy_node()
+            except Exception:
+                pass
+        if spin_thread is not None and spin_thread.is_alive():
+            spin_thread.join(timeout=2.0)
+
+
+class StretchAIDemoBridge:
+    JOINT_LIMITS = [
+        (0.00, 0.51),
+        (0.08, 1.05),
+        (-1.2, 2.2),
+        (-1.0, 1.57),
+        (-1.57, 1.57),
+        (-1.57, 1.57),
+        (-1.0, 1.0),
+        (-0.1, 0.5501),
+        (-2.0, 2.0),
+        (-5.0, 5.0),
+    ]
+
+    CONTROL_MAP = {
+        "arm_extension": 0,
+        "arm_lift": 1,
+        "wrist_yaw": 2,
+        "wrist_pitch": 3,
+        "wrist_roll": 4,
+        "head_pan": 5,
+        "head_tilt": 6,
+        "gripper": 7,
+        "base_linear": 8,
+        "base_angular": 9,
+    }
+
+    JOINT_STATE_NAMES = [
+        "joint_base_x",
+        "joint_base_y",
+        "joint_base_theta",
+        "joint_lift",
+        "joint_arm_l0",
+        "joint_gripper_finger_left",
+        "joint_wrist_roll",
+        "joint_wrist_pitch",
+        "joint_wrist_yaw",
+        "joint_head_pan",
+        "joint_head_tilt",
+    ]
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._rpc: _StretchAIWorkerRPC | None = None
+        self._poll_thread: threading.Thread | None = None
+        self._command_thread: threading.Thread | None = None
+        self._stop_event = threading.Event()
+
+        self.head_rgb: np.ndarray | None = None
+        self.wrist_rgb: np.ndarray | None = None
+        self.head_depth: np.ndarray | None = None
+        self.wrist_depth: np.ndarray | None = None
+
+        self.actual_qpos: list[float] | None = None
+        self.qpos: list[float] | None = None
+        self.published_qpos: list[float] | None = None
+
+        self._base_x = 0.0
+        self._base_y = 0.0
+        self._base_theta = 0.0
+        self._manip_base_x = 0.0
+        self._base_y0: float | None = None
+        self.command_base_pose_xytheta: list[float] | None = [0.0, 0.0, 0.0]
+        self.command_base_pose_last_wall_time: float | None = None
+        self._command_latched_qpos10: list[float] = [0.0] * 10
+        self._command_latched_pose_xytheta: list[float] = [0.0, 0.0, 0.0]
+        self._command_latched_manip_base_x: float = 0.0
+        self._did_initialize_default_pose = False
+
+        self._joint_positions: list[float] | None = None
+        self._joint_velocities: list[float] | None = None
+        self._joint_efforts: list[float] | None = None
+        self._camera_info_head: dict[str, Any] | None = None
+        self._camera_info_wrist: dict[str, Any] | None = None
+        self._mode: str = "unknown"
+        self._at_goal: bool | None = None
+        self._is_homed: bool | None = None
+        self._is_runstopped: bool | None = None
+
+        self._last_exec_result: dict[str, Any] | None = None
+        self._last_cmd_error_t = 0.0
+        self.command_smooth_delay_s = float(DEFAULT_COMMAND_SMOOTH_DELAY_S)
+        self.base_rotate_step_rad = float(np.deg2rad(DEFAULT_BASE_ROTATE_STEP_DEG))
+        self.base_rotate_step_delay_s = float(DEFAULT_BASE_ROTATE_STEP_DELAY_S)
+        self._base_linear_cmd = 0.0
+        self._base_angular_cmd = 0.0
+        self._base_cmd_last_wall_time: float | None = None
+        self._last_base_step_error_t = 0.0
+        self._last_base_theta_warn_t = 0.0
+        self._needs_mode_retry = False
+        self._clock = _DummyClock()
+        self.tf_buffer = _BridgeTFBuffer(self)
+        self.odom = None
+        self._image_source: str = str(STRETCH_AI_DEFAULT_OBS_SOURCE)
+        self._ros_obs_client: RosTopicObservationClient | None = None
+        self._next_ros_connect_t: float = 0.0
+        self._command_history: deque[dict[str, Any]] = deque(maxlen=COMMAND_HISTORY_MAXLEN)
+
+    def _latest_ros_observation_stamp_ns(self) -> int | None:
+        client = self._ros_obs_client
+        if client is None or not client.connected:
+            return None
+        try:
+            timing = client.get_timing_snapshot()
+        except Exception:
+            return None
+        stamp_map = timing.get("stamp_ns") if isinstance(timing.get("stamp_ns"), dict) else {}
+        latest = None
+        for key in ("joint_state", "odom", "head_rgb", "head_depth", "wrist_rgb", "wrist_depth"):
+            v = stamp_map.get(key)
+            if isinstance(v, int):
+                latest = int(v) if latest is None else max(int(latest), int(v))
+        return latest
+
+    def _refresh_state_from_ros_topic(
+        self,
+        *,
+        require_newer_than_ns: int | None = None,
+        timeout_s: float = 0.0,
+    ) -> bool:
+        """Pull latest ROS-topic observation into cached state.
+
+        If `require_newer_than_ns` is provided, poll until a newer ROS stamp arrives
+        or timeout. This reduces stale-state usage after sending chunked commands.
+        """
+        client = self._ros_obs_client
+        if client is None or not client.connected:
+            return False
+        deadline = time.time() + max(0.0, float(timeout_s))
+        while True:
+            try:
+                obs = client.get_observation_snapshot()
+            except Exception:
+                return False
+            stamp_map = obs.get("stamp_ns") if isinstance(obs.get("stamp_ns"), dict) else {}
+            latest_stamp = None
+            for key in ("joint_state", "odom", "head_rgb", "head_depth", "wrist_rgb", "wrist_depth"):
+                v = stamp_map.get(key)
+                if isinstance(v, int):
+                    latest_stamp = int(v) if latest_stamp is None else max(int(latest_stamp), int(v))
+            if (
+                require_newer_than_ns is not None
+                and isinstance(latest_stamp, int)
+                and int(latest_stamp) <= int(require_newer_than_ns)
+                and time.time() < deadline
+            ):
+                time.sleep(0.01)
+                continue
+            try:
+                with self._lock:
+                    aq = obs.get("actual_qpos")
+                    if isinstance(aq, list) and len(aq) > 0:
+                        self.actual_qpos = [float(v) for v in aq[:10]] + [0.0] * max(0, 10 - len(aq))
+                    pose = obs.get("base_pose_xytheta")
+                    if isinstance(pose, list) and len(pose) >= 3:
+                        self._base_x = float(pose[0])
+                        self._base_y = float(pose[1])
+                        if self._base_y0 is None:
+                            self._base_y0 = float(pose[1])
+                        self._base_theta = float(pose[2])
+                    # Keep command pose latched to sent-command history.
+                    # Only initialize once from measurements at startup.
+                    if self.command_base_pose_xytheta is None:
+                        self.command_base_pose_xytheta = [
+                            self._base_x,
+                            self._base_y0 if self._base_y0 is not None else self._base_y,
+                            self._base_theta,
+                        ]
+                    if self.actual_qpos is not None and len(self.actual_qpos) >= 10:
+                        if self.qpos is None:
+                            self.qpos = list(self.actual_qpos)
+                            self.qpos[8] = 0.0
+                            self.qpos[9] = 0.0
+                        if self.published_qpos is None:
+                            self.published_qpos = list(self.qpos)
+                return True
+            except Exception:
+                return False
+
+    @staticmethod
+    def _decode_jpg_rgb(data_b64: str | None) -> np.ndarray | None:
+        if not data_b64:
+            return None
+        try:
+            buf = base64.b64decode(data_b64)
+            arr = np.frombuffer(buf, dtype=np.uint8)
+            bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            if bgr is None:
+                return None
+            return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _decode_depth_png(data_b64: str | None) -> np.ndarray | None:
+        if not data_b64:
+            return None
+        try:
+            buf = base64.b64decode(data_b64)
+            arr = np.frombuffer(buf, dtype=np.uint8)
+            depth_u16 = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
+            if depth_u16 is None:
+                return None
+            if depth_u16.dtype != np.uint16:
+                depth_u16 = depth_u16.astype(np.uint16)
+            return depth_u16.astype(np.float32) / 1000.0
+        except Exception:
+            return None
+
+    @staticmethod
+    def _wrap_angle(theta: float) -> float:
+        return float(np.arctan2(np.sin(theta), np.cos(theta)))
+
+    def _get_ros_minus_wall_ns(self) -> int | None:
+        client = self._ros_obs_client
+        if client is None or not client.connected:
+            return None
+        try:
+            timing = client.get_timing_snapshot()
+        except Exception:
+            return None
+        val = timing.get("ros_minus_wall_ns")
+        return int(val) if isinstance(val, int) else None
+
+    @staticmethod
+    def _mid_joint_limit(limit_pair: tuple[float, float]) -> float:
+        lo, hi = float(limit_pair[0]), float(limit_pair[1])
+        return 0.5 * (lo + hi)
+
+    def _default_command_qpos10(self) -> list[float]:
+        q8 = list(DEFAULT_INIT_CMD_QPOS8) if isinstance(DEFAULT_INIT_CMD_QPOS8, (list, tuple)) else []
+        if len(q8) < 8:
+            q8 = q8 + [0.0] * (8 - len(q8))
+        return [
+            float(np.clip(float(q8[0]), self.JOINT_LIMITS[0][0], self.JOINT_LIMITS[0][1])),
+            float(np.clip(float(q8[1]), self.JOINT_LIMITS[1][0], self.JOINT_LIMITS[1][1])),
+            float(np.clip(float(q8[2]), self.JOINT_LIMITS[2][0], self.JOINT_LIMITS[2][1])),
+            float(np.clip(float(q8[3]), self.JOINT_LIMITS[3][0], self.JOINT_LIMITS[3][1])),
+            float(np.clip(float(q8[4]), self.JOINT_LIMITS[4][0], self.JOINT_LIMITS[4][1])),
+            float(np.clip(float(q8[5]), self.JOINT_LIMITS[5][0], self.JOINT_LIMITS[5][1])),
+            float(np.clip(float(q8[6]), self.JOINT_LIMITS[6][0], self.JOINT_LIMITS[6][1])),
+            float(np.clip(float(q8[7]), self.JOINT_LIMITS[7][0], self.JOINT_LIMITS[7][1])),
+            0.0,
+            0.0,
+        ]
+
+    def _initialize_default_command_pose(self, *, send_to_robot: bool = True) -> None:
+        if self._did_initialize_default_pose:
+            return
+        q_default = self._default_command_qpos10()
+        pose_default = self.get_measured_base_pose_xytheta()
+        if not (isinstance(pose_default, list) and len(pose_default) >= 3):
+            pose_default = [0.0, 0.0, 0.0]
+        pose_default = [float(pose_default[0]), float(pose_default[1]), float(pose_default[2])]
+        with self._lock:
+            self.qpos = list(q_default)
+            self.published_qpos = list(q_default)
+            self.command_base_pose_xytheta = list(pose_default)
+            self.command_base_pose_last_wall_time = time.time()
+            self._manip_base_x = 0.0
+            if self._base_y0 is None:
+                self._base_y0 = float(pose_default[1])
+            self._base_linear_cmd = 0.0
+            self._base_angular_cmd = 0.0
+            self._needs_mode_retry = False
+            self._command_latched_qpos10 = list(q_default)
+            self._command_latched_pose_xytheta = list(pose_default)
+            self._command_latched_manip_base_x = 0.0
+        self._record_command_event(
+            "init_default_target",
+            qpos10=q_default,
+            command_pose_xytheta=pose_default,
+            manip_base_x_cmd=0.0,
+        )
+
+        if bool(send_to_robot):
+            joint6 = [
+                0.0,               # manipulation base_x
+                q_default[1],      # lift
+                q_default[0],      # arm extension
+                q_default[2],      # wrist_yaw
+                q_default[3],      # wrist_pitch
+                q_default[4],      # wrist_roll
+            ]
+            ok = self.execute_arm_to(
+                joint6,
+                gripper=q_default[7],
+                head=[q_default[5], q_default[6]],
+                blocking=True,
+                timeout_s=12.0,
+                reliable=False,
+            )
+            if not ok:
+                print(
+                    "[stretch_ai_bridge] default init pose command failed; "
+                    "continuing with local command targets.",
+                    file=sys.stderr,
+                )
+        self._did_initialize_default_pose = True
+
+    def move_to_startup_home_pose(self, *, timeout_s: float = 12.0) -> bool:
+        """Move robot to the same startup/default joint target used at UI load."""
+        q_default = self._default_command_qpos10()
+        pose_default = self.get_measured_base_pose_xytheta()
+        if not (isinstance(pose_default, list) and len(pose_default) >= 3):
+            pose_default = [0.0, 0.0, 0.0]
+        pose_default = [float(pose_default[0]), float(pose_default[1]), float(pose_default[2])]
+
+        with self._lock:
+            self.qpos = list(q_default)
+            self.published_qpos = list(q_default)
+            self.command_base_pose_xytheta = list(pose_default)
+            self.command_base_pose_last_wall_time = time.time()
+            self._manip_base_x = 0.0
+            if self._base_y0 is None:
+                self._base_y0 = float(pose_default[1])
+            self._base_linear_cmd = 0.0
+            self._base_angular_cmd = 0.0
+            self._needs_mode_retry = False
+            self._command_latched_qpos10 = list(q_default)
+            self._command_latched_pose_xytheta = list(pose_default)
+            self._command_latched_manip_base_x = 0.0
+
+        self._record_command_event(
+            "manual_home_target",
+            qpos10=q_default,
+            command_pose_xytheta=pose_default,
+            manip_base_x_cmd=0.0,
+        )
+
+        joint6 = [
+            0.0,               # manipulation base_x
+            q_default[1],      # lift
+            q_default[0],      # arm extension
+            q_default[2],      # wrist_yaw
+            q_default[3],      # wrist_pitch
+            q_default[4],      # wrist_roll
+        ]
+        ok = self.execute_arm_to(
+            joint6,
+            gripper=q_default[7],
+            head=[q_default[5], q_default[6]],
+            blocking=True,
+            timeout_s=float(timeout_s),
+            reliable=False,
+        )
+        return bool(ok)
+
+    def _record_command_event(
+        self,
+        reason: str,
+        *,
+        qpos10: list[float] | None = None,
+        command_pose_xytheta: list[float] | None = None,
+        manip_base_x_cmd: float | None = None,
+        wall_time_ns: int | None = None,
+    ) -> None:
+        with self._lock:
+            if isinstance(qpos10, list) and len(qpos10) > 0:
+                q = [float(v) for v in qpos10[:10]]
+            else:
+                q = list(self._command_latched_qpos10)
+            if len(q) < 10:
+                q = q + [0.0] * (10 - len(q))
+            q[8] = 0.0
+            q[9] = 0.0
+
+            if isinstance(command_pose_xytheta, list) and len(command_pose_xytheta) >= 3:
+                pose = [
+                    float(command_pose_xytheta[0]),
+                    float(command_pose_xytheta[1]),
+                    float(command_pose_xytheta[2]),
+                ]
+            else:
+                pose = list(self._command_latched_pose_xytheta)
+            if isinstance(manip_base_x_cmd, (int, float)):
+                manip_bx_cmd = float(manip_base_x_cmd)
+            else:
+                manip_bx_cmd = float(self._command_latched_manip_base_x)
+            self._command_latched_qpos10 = [float(v) for v in q[:10]]
+            self._command_latched_pose_xytheta = [float(pose[0]), float(pose[1]), float(pose[2])]
+            self._command_latched_manip_base_x = float(manip_bx_cmd)
+        wall_ns = int(time.time_ns()) if wall_time_ns is None else int(wall_time_ns)
+        ros_minus_wall_ns = self._get_ros_minus_wall_ns()
+        ros_est_ns = int(wall_ns + ros_minus_wall_ns) if ros_minus_wall_ns is not None else None
+        action11 = [float(v) for v in q[:8]] + [float(pose[0]), float(pose[1]), float(pose[2])]
+        self._command_history.append(
+            {
+                "reason": str(reason),
+                "wall_time_ns": wall_ns,
+                "ros_time_ns_est": ros_est_ns,
+                "qpos10": [float(v) for v in q[:10]],
+                "command_pose_xytheta": [float(pose[0]), float(pose[1]), float(pose[2])],
+                "manip_base_x_cmd": float(manip_bx_cmd),
+                "action_command11": action11,
+            }
+        )
+
+    def _select_command_event(self, reference_stamp_ns: int | None = None) -> dict[str, Any] | None:
+        if len(self._command_history) == 0:
+            return None
+        # Keep action_command as a latched signal: update when command is sent,
+        # hold that value until the next command is sent.
+        # This avoids apparent lag introduced by cross-clock stamp matching.
+        return dict(self._command_history[-1])
+
+    def _worker_script_path(self) -> Path:
+        return Path(__file__).with_name("stretch_ai_bridge_worker.py")
+
+    def _worker_cmd(self) -> tuple[list[str], dict[str, str]]:
+        worker_path = self._worker_script_path()
+        if not worker_path.exists():
+            raise RuntimeError(f"Missing worker script: {worker_path}")
+
+        cmd = [STRETCH_AI_WORKER_LAUNCHER, "run", "-n", STRETCH_AI_ENV_NAME, STRETCH_AI_WORKER_PYTHON, "-u"]
+        cmd.append(str(worker_path))
+        cmd += ["--jpeg-quality", str(STRETCH_AI_WORKER_JPEG_QUALITY)]
+        cmd += ["--obs-source", "bridge"]
+        if STRETCH_AI_ROTATE_HEAD_90_CW:
+            cmd.append("--rotate-head-90-cw")
+
+        env = os.environ.copy()
+        src_path = str(Path(STRETCH_AI_REPO) / "src")
+        existing = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = src_path if not existing else src_path + os.pathsep + existing
+        env["PYTHONNOUSERSITE"] = "1"
+        if STRETCH_AI_WORKER_DEBUG:
+            env["STRETCH_AI_WORKER_DEBUG"] = "1"
+        return cmd, env
+
+    def connect(self, timeout_s: float = STRETCH_AI_CONNECT_TIMEOUT_S) -> None:
+        cmd, env = self._worker_cmd()
+        self._rpc = _StretchAIWorkerRPC(cmd, env=env, cwd=str(Path(__file__).resolve().parent.parent))
+        self._rpc.start()
+        self._rpc.request("ping", {}, timeout_s=timeout_s)
+        self._rpc.request(
+            "connect",
+            {
+                "robot_ip": STRETCH_AI_ROBOT_IP,
+                "use_remote_computer": STRETCH_AI_USE_REMOTE_COMPUTER,
+                "recv_port": STRETCH_AI_RECV_PORT,
+                "send_port": STRETCH_AI_SEND_PORT,
+                "recv_state_port": STRETCH_AI_RECV_STATE_PORT,
+                "recv_servo_port": STRETCH_AI_RECV_SERVO_PORT,
+            },
+            timeout_s=timeout_s,
+        )
+
+        self._stop_event.clear()
+        self._poll_thread = threading.Thread(target=self._poll_loop, daemon=True)
+        self._poll_thread.start()
+        self._command_thread = threading.Thread(target=self._command_loop, daemon=True)
+        self._command_thread.start()
+
+        # This variant enforces ROS-topic observations for synchronized recording.
+        if FORCE_ROS_TOPIC_OBSERVATION:
+            with self._lock:
+                self._image_source = "ros_topic"
+        ok, err = self._try_connect_ros_topics(timeout_s=min(float(timeout_s), ROS_TOPICS_CONNECT_TIMEOUT_S))
+        if not ok:
+            raise RuntimeError(f"ros_topic observation connect failed: {err}")
+
+        deadline = time.time() + float(timeout_s)
+        while time.time() < deadline:
+            source = self.get_image_source()
+            if source == "ros_topic":
+                client = self._ros_obs_client
+                if client is not None and client.connected:
+                    hr, _, _, _, _, _ = client.get_snapshot()
+                    obs = client.get_observation_snapshot()
+                    aq = obs.get("actual_qpos")
+                    if hr is not None and isinstance(aq, list) and len(aq) > 0:
+                        self._initialize_default_command_pose(
+                            send_to_robot=bool(AUTO_SEND_DEFAULT_POSE_ON_CONNECT)
+                        )
+                        return
+            else:
+                with self._lock:
+                    if self.actual_qpos is not None and self.head_rgb is not None:
+                        return
+            time.sleep(0.05)
+        raise RuntimeError(
+            f"stretch_ai worker connected, but no observations arrived before timeout "
+            f"(source={self.get_image_source()})"
+        )
+
+    def _poll_loop(self) -> None:
+        period = 1.0 / max(1e-3, float(STRETCH_AI_OBS_POLL_HZ))
+        while not self._stop_event.is_set():
+            t0 = time.time()
+            try:
+                if self._rpc is None:
+                    break
+                obs = self._rpc.request("observe", {}, timeout_s=STRETCH_AI_RPC_TIMEOUT_S)
+
+                head = self._decode_jpg_rgb(obs.get("head_jpg_b64"))
+                wrist = self._decode_jpg_rgb(obs.get("wrist_jpg_b64"))
+                head_depth = self._decode_depth_png(obs.get("head_depth_png_b64"))
+                wrist_depth = self._decode_depth_png(obs.get("wrist_depth_png_b64"))
+
+                q = obs.get("actual_qpos")
+                q_out = None
+                if isinstance(q, list):
+                    q_out = [float(v) for v in q[:10]]
+                    if len(q_out) < 10:
+                        q_out += [0.0] * (10 - len(q_out))
+
+                base_pose = obs.get("base_pose")
+                if isinstance(base_pose, list) and len(base_pose) >= 3:
+                    bx, by, bt = float(base_pose[0]), float(base_pose[1]), float(base_pose[2])
+                else:
+                    bx, by, bt = self._base_x, self._base_y, self._base_theta
+                manip_base_x_obs = obs.get("manip_base_x")
+                if isinstance(manip_base_x_obs, (int, float)):
+                    manip_base_x = float(manip_base_x_obs)
+                else:
+                    manip_base_x = self._manip_base_x
+
+                with self._lock:
+                    if head is not None:
+                        self.head_rgb = head
+                    if wrist is not None:
+                        self.wrist_rgb = wrist
+                    if head_depth is not None:
+                        self.head_depth = head_depth
+                    if wrist_depth is not None:
+                        self.wrist_depth = wrist_depth
+                    if q_out is not None:
+                        self.actual_qpos = q_out
+                        if self.qpos is None:
+                            self.qpos = list(q_out)
+                            self.qpos[8] = 0.0
+                            self.qpos[9] = 0.0
+                        if self.published_qpos is None:
+                            self.published_qpos = list(self.qpos)
+                    self._base_x = bx
+                    self._base_y = by
+                    if self._base_y0 is None:
+                        self._base_y0 = float(by)
+                    self._base_theta = bt
+                    self._manip_base_x = float(manip_base_x)
+                    if self.command_base_pose_xytheta is None:
+                        self.command_base_pose_xytheta = [bx, by, bt]
+                    if self.command_base_pose_last_wall_time is None:
+                        self.command_base_pose_last_wall_time = time.time()
+
+                    self._joint_positions = obs.get("joint_positions") if isinstance(obs.get("joint_positions"), list) else None
+                    self._joint_velocities = obs.get("joint_velocities") if isinstance(obs.get("joint_velocities"), list) else None
+                    self._joint_efforts = obs.get("joint_efforts") if isinstance(obs.get("joint_efforts"), list) else None
+                    self._camera_info_head = obs.get("camera_info_head") if isinstance(obs.get("camera_info_head"), dict) else None
+                    self._camera_info_wrist = obs.get("camera_info_wrist") if isinstance(obs.get("camera_info_wrist"), dict) else None
+                    mode = obs.get("mode")
+                    if isinstance(mode, str) and mode:
+                        self._mode = mode
+                    self._at_goal = bool(obs.get("at_goal")) if obs.get("at_goal") is not None else None
+                    self._is_homed = bool(obs.get("is_homed")) if obs.get("is_homed") is not None else None
+                    self._is_runstopped = bool(obs.get("is_runstopped")) if obs.get("is_runstopped") is not None else None
+                    lin_v = float(q_out[8]) if q_out is not None and len(q_out) > 8 else 0.0
+                    ang_v = float(q_out[9]) if q_out is not None and len(q_out) > 9 else 0.0
+                    self.odom = types.SimpleNamespace(
+                        pose=types.SimpleNamespace(
+                            pose=types.SimpleNamespace(
+                                position=types.SimpleNamespace(x=float(bx), y=float(by), z=0.0),
+                                orientation=types.SimpleNamespace(
+                                    x=0.0,
+                                    y=0.0,
+                                    z=float(np.sin(bt / 2.0)),
+                                    w=float(np.cos(bt / 2.0)),
+                                ),
+                            )
+                        ),
+                        twist=types.SimpleNamespace(
+                            twist=types.SimpleNamespace(
+                                linear=types.SimpleNamespace(x=lin_v, y=0.0, z=0.0),
+                                angular=types.SimpleNamespace(x=0.0, y=0.0, z=ang_v),
+                            )
+                        ),
+                    )
+            except Exception:
+                time.sleep(0.1)
+
+            dt = time.time() - t0
+            sleep_s = max(0.0, period - dt)
+            if sleep_s > 0:
+                time.sleep(sleep_s)
+
+    def _command_loop(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                with self._lock:
+                    dx = float(self._base_linear_cmd)
+                    dtheta = float(self._base_angular_cmd)
+                    # Consume latched base step once so a press issues one relative
+                    # x/theta goal instead of repeated goals while held.
+                    if (abs(dx) > 1e-6) or (abs(dtheta) > 1e-6):
+                        self._base_linear_cmd = 0.0
+                        self._base_angular_cmd = 0.0
+                    self._base_cmd_last_wall_time = time.time()
+                base_active = (abs(dx) > 1e-6) or (abs(dtheta) > 1e-6)
+
+                # Base control path:
+                # - linear: send absolute base_x target x2 = observed x1 + dx
+                # - angular: keep relative rotate action
+                if base_active:
+                    if abs(dx) > 1e-6 and abs(dtheta) <= 1e-6:
+                        ok = self._send_manual_base_x_absolute_step(
+                            step_dx=dx,
+                            timeout_s=max(1.5, 2.0 + 4.0 * abs(dx)),
+                        )
+                    elif abs(dtheta) > 1e-6 and abs(dx) <= 1e-6:
+                        ok = self._send_manual_base_theta_absolute_step(
+                            step_dtheta=dtheta,
+                            timeout_s=max(1.5, 2.0 + 4.0 * abs(dtheta)),
+                        )
+                    else:
+                        # Fallback for combined inputs (rare from current UI bindings).
+                        ok = self.move_base_relative(
+                            dx=dx,
+                            dy=0.0,
+                            dtheta=dtheta,
+                            blocking=False,
+                            timeout_s=max(1.5, 2.0 + 4.0 * (abs(dx) + abs(dtheta))),
+                        )
+                    if not ok:
+                        t_now = time.time()
+                        if t_now - self._last_base_step_error_t > 2.0:
+                            self._last_base_step_error_t = t_now
+                            print("[stretch_ai_bridge] base manual step command failed", file=sys.stderr)
+
+                pending = self.has_pending_command()
+                if pending:
+                    self.publish_commands(force=False)
+            except Exception:
+                pass
+            time.sleep(max(0.01, float(self.command_smooth_delay_s)))
+
+    def _send_manual_base_x_absolute_step(self, *, step_dx: float, timeout_s: float = 2.0) -> bool:
+        """Manual base button semantics via execute_arm_to manipulation base_x target."""
+        try:
+            with self._lock:
+                # execute_arm_to base_x is manipulation-space base_x.
+                # Use latched command base_x so post-sync steps start from synced cmd state.
+                obs_manip_x = float(self._command_latched_manip_base_x)
+                target_manip_base_x = float(
+                    np.clip(
+                        obs_manip_x + float(step_dx),
+                        float(MANIP_BASE_X_LIMITS[0]),
+                        float(MANIP_BASE_X_LIMITS[1]),
+                    )
+                )
+                applied_step_dx = float(target_manip_base_x - obs_manip_x)
+                # Saturated at manip-base limit: keep command unchanged and skip send.
+                if abs(applied_step_dx) <= 1e-9:
+                    return True
+
+                # Keep command-pose tracking in world x/y/theta space for table/recording.
+                if isinstance(self.command_base_pose_xytheta, list) and len(self.command_base_pose_xytheta) >= 3:
+                    cmd_x_origin = float(self.command_base_pose_xytheta[0])
+                    cmd_y = float(self.command_base_pose_xytheta[1])
+                    cmd_theta = float(self.command_base_pose_xytheta[2])
+                else:
+                    cmd_x_origin = float(self._base_x)
+                    cmd_y = float(self._base_y0 if self._base_y0 is not None else self._base_y)
+                    cmd_theta = float(self._base_theta)
+                cmd_x_world = float(cmd_x_origin + applied_step_dx)
+                self.command_base_pose_xytheta = [cmd_x_world, cmd_y, cmd_theta]
+                self.command_base_pose_last_wall_time = time.time()
+
+                if isinstance(self.qpos, list) and len(self.qpos) >= 8:
+                    q_src = list(self.qpos[:8])
+                elif isinstance(self.actual_qpos, list) and len(self.actual_qpos) >= 8:
+                    q_src = list(self.actual_qpos[:8])
+                else:
+                    q_src = [0.0] * 8
+
+                lift = float(np.clip(float(q_src[1]), self.JOINT_LIMITS[1][0], self.JOINT_LIMITS[1][1]))
+                arm = float(np.clip(float(q_src[0]), self.JOINT_LIMITS[0][0], self.JOINT_LIMITS[0][1]))
+                wrist_yaw = float(np.clip(float(q_src[2]), self.JOINT_LIMITS[2][0], self.JOINT_LIMITS[2][1]))
+                wrist_pitch = float(np.clip(float(q_src[3]), self.JOINT_LIMITS[3][0], self.JOINT_LIMITS[3][1]))
+                wrist_roll = float(np.clip(float(q_src[4]), self.JOINT_LIMITS[4][0], self.JOINT_LIMITS[4][1]))
+                head_pan = float(np.clip(float(q_src[5]), self.JOINT_LIMITS[5][0], self.JOINT_LIMITS[5][1]))
+                head_tilt = float(np.clip(float(q_src[6]), self.JOINT_LIMITS[6][0], self.JOINT_LIMITS[6][1]))
+                gripper = float(np.clip(float(q_src[7]), self.JOINT_LIMITS[7][0], self.JOINT_LIMITS[7][1]))
+
+            return self.execute_arm_to(
+                [target_manip_base_x, lift, arm, wrist_yaw, wrist_pitch, wrist_roll],
+                gripper=gripper,
+                head=[head_pan, head_tilt],
+                blocking=False,
+                timeout_s=float(timeout_s),
+                reliable=False,
+            )
+        except Exception:
+            return False
+
+    def _send_manual_base_theta_absolute_step(self, *, step_dtheta: float, timeout_s: float = 2.0) -> bool:
+        """Manual rotate semantics: theta2 = observed theta1 + step."""
+        try:
+            with self._lock:
+                obs_x = float(self._base_x)
+                obs_y = float(self._base_y0 if self._base_y0 is not None else self._base_y)
+                obs_theta = float(self._base_theta)
+                target_theta = self._wrap_angle(obs_theta + float(step_dtheta))
+                # Seed command-pose from current observation so move_base_relative
+                # records an absolute target for this click.
+                self.command_base_pose_xytheta = [obs_x, obs_y, obs_theta]
+                self.command_base_pose_last_wall_time = time.time()
+            rel_theta = self._wrap_angle(target_theta - obs_theta)
+            return self.move_base_relative(
+                dx=0.0,
+                dy=0.0,
+                dtheta=float(rel_theta),
+                blocking=False,
+                timeout_s=float(timeout_s),
+            )
+        except Exception:
+            return False
+
+    def _integrate_command_base_pose_until(self, now_wall_time: float):
+        if self.command_base_pose_xytheta is None:
+            self.command_base_pose_xytheta = [self._base_x, self._base_y, self._base_theta]
+        if self.command_base_pose_last_wall_time is None:
+            self.command_base_pose_last_wall_time = float(now_wall_time)
+            return
+        dt = float(now_wall_time) - float(self.command_base_pose_last_wall_time)
+        if dt <= 0.0:
+            self.command_base_pose_last_wall_time = float(now_wall_time)
+            return
+        dt = min(dt, 1.0)
+        if self.published_qpos is None or len(self.published_qpos) < 10:
+            self.command_base_pose_last_wall_time = float(now_wall_time)
+            return
+        v = float(self.published_qpos[8])
+        w = float(self.published_qpos[9])
+        x, y, theta = [float(vv) for vv in self.command_base_pose_xytheta]
+        x += v * np.cos(theta) * dt
+        y += v * np.sin(theta) * dt
+        theta = self._wrap_angle(theta + w * dt)
+        self.command_base_pose_xytheta = [x, y, theta]
+        self.command_base_pose_last_wall_time = float(now_wall_time)
+
+    def _advance_command_base_pose_by_relative_step(self, dx: float, dy: float, dtheta: float) -> None:
+        """Advance command base x/y/theta by a relative step in robot frame."""
+        with self._lock:
+            if self.command_base_pose_xytheta is None:
+                self.command_base_pose_xytheta = [self._base_x, self._base_y, self._base_theta]
+            x, y, theta = [float(v) for v in self.command_base_pose_xytheta]
+            x += float(dx) * np.cos(theta) - float(dy) * np.sin(theta)
+            y += float(dx) * np.sin(theta) + float(dy) * np.cos(theta)
+            theta = self._wrap_angle(theta + float(dtheta))
+            self.command_base_pose_xytheta = [x, y, theta]
+            self.command_base_pose_last_wall_time = time.time()
+
+    def publish_commands(self, *, force: bool = False) -> None:
+        rpc = self._rpc
+        if rpc is None:
+            return
+        pre_stamp_ns = self._latest_ros_observation_stamp_ns()
+
+        prev_published: list[float] | None = None
+        with self._lock:
+            if self.qpos is None:
+                return
+            if self.published_qpos is None or len(self.published_qpos) != len(self.qpos):
+                self.published_qpos = list(self.qpos)
+            prev_published = list(self.published_qpos)
+
+            for i, target in enumerate(self.qpos):
+                current = float(self.published_qpos[i])
+                target = float(target)
+                # Base is controlled via relative x/y/theta commands. Keep qpos base channels at zero.
+                if i >= 8:
+                    self.published_qpos[i] = 0.0
+                    continue
+                step_limit = float(COMMAND_SMOOTH_STEP_SIZES[i]) if i < len(COMMAND_SMOOTH_STEP_SIZES) else 0.0
+                if step_limit <= 0.0:
+                    self.published_qpos[i] = target
+                    continue
+                delta = target - current
+                if abs(delta) <= step_limit:
+                    self.published_qpos[i] = target
+                else:
+                    self.published_qpos[i] = current + (step_limit if delta > 0.0 else -step_limit)
+
+            cmd = [float(v) for v in self.published_qpos]
+
+        # Record immediately when command is sent so action_command leads
+        # subsequent observations until the next command update.
+        self._record_command_event("execute_qpos_cmd", qpos10=cmd)
+        try:
+            # print(cmd)
+            result = rpc.request(
+                "execute_qpos_cmd",
+                {
+                    "qpos_cmd": cmd,
+                    "force": bool(force),
+                    # Base is commanded through move_base_relative()/rotate_base_relative(),
+                    # not through qpos base velocity channels.
+                    "base_mode": "none",
+                },
+                timeout_s=max(STRETCH_AI_RPC_TIMEOUT_S, 20.0),
+            )
+            # print(result)
+            retry_needed = False
+            if isinstance(result, dict):
+                if result.get("waiting_for_mode") is not None:
+                    retry_needed = True
+            with self._lock:
+                self._last_exec_result = dict(result) if isinstance(result, dict) else {"result": result}
+                mode = self._last_exec_result.get("mode") if self._last_exec_result else None
+                if isinstance(mode, str) and mode:
+                    self._mode = mode
+                if retry_needed and prev_published is not None:
+                    # Keep target->published delta so control tick retries after mode transition.
+                    self.published_qpos = list(prev_published)
+                    self._needs_mode_retry = True
+                else:
+                    self._needs_mode_retry = False
+        except Exception as exc:
+            now = time.time()
+            with self._lock:
+                if prev_published is not None:
+                    self.published_qpos = list(prev_published)
+                self._needs_mode_retry = True
+            if now - self._last_cmd_error_t > 2.0:
+                self._last_cmd_error_t = now
+                print(f"[stretch_ai_bridge] command error: {exc}", file=sys.stderr)
+        finally:
+            self._refresh_state_from_ros_topic(
+                require_newer_than_ns=pre_stamp_ns,
+                timeout_s=0.20,
+            )
+
+    def set_control(self, control_name: str, value: float) -> None:
+        idx = self.CONTROL_MAP.get(control_name)
+        if idx is None:
+            return
+        actual_for_init = self.get_actual_qpos()
+        with self._lock:
+            if self.qpos is None:
+                if not actual_for_init:
+                    return
+                self.qpos = list(actual_for_init[:10]) + [0.0] * max(0, 10 - len(actual_for_init))
+                self.qpos[8] = 0.0
+                self.qpos[9] = 0.0
+            lo, hi = self.JOINT_LIMITS[idx]
+            clipped = float(np.clip(value, lo, hi))
+            if idx == 8:
+                self._base_linear_cmd = clipped
+                # Keep qpos base channels at zero; base is controlled via xyt relative actions.
+                self.qpos[8] = 0.0
+                self.qpos[9] = 0.0
+                return
+            if idx == 9:
+                self._base_angular_cmd = clipped
+                self.qpos[8] = 0.0
+                self.qpos[9] = 0.0
+                return
+            self.qpos[idx] = clipped
+
+    def adjust_control(self, control_name: str, delta: float) -> None:
+        idx = self.CONTROL_MAP.get(control_name)
+        if idx is None:
+            return
+        actual_for_init = self.get_actual_qpos()
+        with self._lock:
+            if self.qpos is None:
+                if not actual_for_init:
+                    return
+                self.qpos = list(actual_for_init[:10]) + [0.0] * max(0, 10 - len(actual_for_init))
+                self.qpos[8] = 0.0
+                self.qpos[9] = 0.0
+            lo, hi = self.JOINT_LIMITS[idx]
+            if idx == 8:
+                self._base_linear_cmd = float(np.clip(self._base_linear_cmd + float(delta), lo, hi))
+                self.qpos[8] = 0.0
+                self.qpos[9] = 0.0
+                return
+            if idx == 9:
+                self._base_angular_cmd = float(np.clip(self._base_angular_cmd + float(delta), lo, hi))
+                self.qpos[8] = 0.0
+                self.qpos[9] = 0.0
+                return
+            self.qpos[idx] = float(np.clip(self.qpos[idx] + float(delta), lo, hi))
+
+    def stop_base(self) -> None:
+        self.set_control("base_linear", 0.0)
+        self.set_control("base_angular", 0.0)
+        with self._lock:
+            self._base_cmd_last_wall_time = time.time()
+
+    def move_base_relative(
+        self,
+        dx: float = 0.0,
+        dy: float = 0.0,
+        dtheta: float = 0.0,
+        *,
+        blocking: bool = False,
+        timeout_s: float = 3.0,
+    ) -> bool:
+        """Send a relative base x/y/theta command through bridge navigation action."""
+        rpc = self._rpc
+        if rpc is None:
+            return False
+        pre_stamp_ns = self._latest_ros_observation_stamp_ns()
+        q_event = None
+        pose_event = None
+        with self._lock:
+            if self.command_base_pose_xytheta is None:
+                self.command_base_pose_xytheta = [float(self._base_x), float(self._base_y), float(self._base_theta)]
+            x, y, theta = [float(v) for v in self.command_base_pose_xytheta]
+            if abs(float(dy)) <= 1e-12 and abs(float(dtheta)) <= 1e-12:
+                # For x-only commands, keep y/theta latched in action_command.
+                x += float(dx)
+            else:
+                x += float(dx) * np.cos(theta) - float(dy) * np.sin(theta)
+                y += float(dx) * np.sin(theta) + float(dy) * np.cos(theta)
+                theta = self._wrap_angle(theta + float(dtheta))
+            self.command_base_pose_xytheta = [x, y, theta]
+            self.command_base_pose_last_wall_time = time.time()
+            pose_event = [x, y, theta]
+            q_now = list(self._command_latched_qpos10)
+            q_event = [float(v) for v in q_now[:10]]
+            if len(q_event) < 10:
+                q_event += [0.0] * (10 - len(q_event))
+            q_event[8] = 0.0
+            q_event[9] = 0.0
+
+        self._record_command_event(
+            "move_base_relative",
+            qpos10=q_event,
+            command_pose_xytheta=pose_event,
+        )
+        try:
+            res = rpc.request(
+                "move_base_relative",
+                {
+                    "dx": float(dx),
+                    "dy": float(dy),
+                    "dtheta": float(dtheta),
+                    "blocking": bool(blocking),
+                    "timeout_s": float(timeout_s),
+                },
+                timeout_s=max(2.0, float(timeout_s) + 2.0),
+            )
+            # print(res)
+            with self._lock:
+                self._last_exec_result = dict(res) if isinstance(res, dict) else {"result": res}
+            ok = bool(isinstance(res, dict) and res.get("ok", False))
+            return ok
+        except Exception as exc:
+            now = time.time()
+            if now - self._last_cmd_error_t > 2.0:
+                self._last_cmd_error_t = now
+                print(f"[stretch_ai_bridge] move_base_relative error: {exc}", file=sys.stderr)
+            return False
+        finally:
+            if bool(blocking):
+                self._refresh_state_from_ros_topic(
+                    require_newer_than_ns=pre_stamp_ns,
+                    timeout_s=0.60,
+                )
+            else:
+                self._refresh_state_from_ros_topic(timeout_s=0.0)
+
+    def rotate_base_relative(self, theta_rad: float, timeout_s: float = 10.0) -> bool:
+        """Rotate base by relative yaw angle using bridge xyt navigation action."""
+        rpc = self._rpc
+        if rpc is None:
+            return False
+        pre_stamp_ns = self._latest_ros_observation_stamp_ns()
+        q_event = None
+        pose_event = None
+        try:
+            # Ensure streaming velocity channels are zero before one-shot rotate.
+            with self._lock:
+                if self.qpos is not None and len(self.qpos) >= 10:
+                    self.qpos[8] = 0.0
+                    self.qpos[9] = 0.0
+                if self.published_qpos is not None and len(self.published_qpos) >= 10:
+                    self.published_qpos[8] = 0.0
+                    self.published_qpos[9] = 0.0
+                if self.command_base_pose_xytheta is None:
+                    self.command_base_pose_xytheta = [float(self._base_x), float(self._base_y), float(self._base_theta)]
+                x, y, theta = [float(v) for v in self.command_base_pose_xytheta]
+                theta = self._wrap_angle(theta + float(theta_rad))
+                self.command_base_pose_xytheta = [x, y, theta]
+                self.command_base_pose_last_wall_time = time.time()
+                pose_event = [x, y, theta]
+                if self._base_y0 is not None:
+                    pose_event[1] = float(self._base_y0)
+                q_now = list(self._command_latched_qpos10)
+                q_event = [float(v) for v in q_now[:10]]
+                if len(q_event) < 10:
+                    q_event += [0.0] * (10 - len(q_event))
+                q_event[8] = 0.0
+                q_event[9] = 0.0
+
+            self._record_command_event(
+                "rotate_base_relative",
+                qpos10=q_event,
+                command_pose_xytheta=pose_event,
+            )
+            res = rpc.request(
+                "rotate_base_relative",
+                {"theta_rad": float(theta_rad), "timeout_s": float(timeout_s)},
+                timeout_s=max(5.0, float(timeout_s) + 3.0),
+            )
+            # print(res)
+            with self._lock:
+                self._last_exec_result = dict(res) if isinstance(res, dict) else {"result": res}
+            ok = bool(isinstance(res, dict) and res.get("ok", False))
+            return ok
+        except Exception as exc:
+            now = time.time()
+            if now - self._last_cmd_error_t > 2.0:
+                self._last_cmd_error_t = now
+                print(f"[stretch_ai_bridge] rotate_base_relative error: {exc}", file=sys.stderr)
+            return False
+        finally:
+            # rotate_base_relative is blocking by design
+            self._refresh_state_from_ros_topic(
+                require_newer_than_ns=pre_stamp_ns,
+                timeout_s=0.60,
+            )
+
+    def execute_arm_to(
+        self,
+        joint6: list[float],
+        *,
+        gripper: float | None = None,
+        head: list[float] | None = None,
+        blocking: bool = True,
+        timeout_s: float = 8.0,
+        reliable: bool = False,
+    ) -> bool:
+        """Direct arm_to wrapper using stretch_ai client semantics.
+
+        joint6 ordering:
+          [base_x, lift, arm, wrist_yaw, wrist_pitch, wrist_roll]
+        """
+        rpc = self._rpc
+        if rpc is None:
+            return False
+        pre_stamp_ns = self._latest_ros_observation_stamp_ns()
+        vec_cmd = np.asarray(joint6, dtype=np.float32).reshape(-1)
+        if vec_cmd.shape[0] < 6:
+            return False
+        vec_cmd = vec_cmd[:6].copy()
+        grip_cmd = None if gripper is None else float(gripper)
+        head_cmd = None if head is None else [float(head[0]), float(head[1])]
+
+        q_event = None
+        pose_event = None
+        with self._lock:
+            q_now = list(self._command_latched_qpos10)
+            q_event = [float(v) for v in q_now[:10]]
+            if len(q_event) < 10:
+                q_event += [0.0] * (10 - len(q_event))
+            q_event[0] = float(np.clip(float(vec_cmd[2]), self.JOINT_LIMITS[0][0], self.JOINT_LIMITS[0][1]))
+            q_event[1] = float(np.clip(float(vec_cmd[1]), self.JOINT_LIMITS[1][0], self.JOINT_LIMITS[1][1]))
+            q_event[2] = float(np.clip(float(vec_cmd[3]), self.JOINT_LIMITS[2][0], self.JOINT_LIMITS[2][1]))
+            q_event[3] = float(np.clip(float(vec_cmd[4]), self.JOINT_LIMITS[3][0], self.JOINT_LIMITS[3][1]))
+            q_event[4] = float(np.clip(float(vec_cmd[5]), self.JOINT_LIMITS[4][0], self.JOINT_LIMITS[4][1]))
+            if grip_cmd is not None:
+                q_event[7] = float(np.clip(float(grip_cmd), self.JOINT_LIMITS[7][0], self.JOINT_LIMITS[7][1]))
+            if isinstance(head_cmd, list) and len(head_cmd) >= 2:
+                q_event[5] = float(np.clip(float(head_cmd[0]), self.JOINT_LIMITS[5][0], self.JOINT_LIMITS[5][1]))
+                q_event[6] = float(np.clip(float(head_cmd[1]), self.JOINT_LIMITS[6][0], self.JOINT_LIMITS[6][1]))
+            else:
+                # Always send explicit current head target to avoid hidden worker
+                # defaults nudging pan/tilt on first arm_to command.
+                head_cmd = [float(q_event[5]), float(q_event[6])]
+            q_event[8] = 0.0
+            q_event[9] = 0.0
+            pose_event = (
+                list(self.command_base_pose_xytheta)
+                if self.command_base_pose_xytheta is not None
+                else [float(self._base_x), float(self._base_y), float(self._base_theta)]
+            )
+            # IK arm_to base_x is manipulation-space x. Reflect its delta into
+            # command-pose x for action_command unless caller already applied it.
+            prev_manip_cmd = float(self._command_latched_manip_base_x)
+            delta_manip_cmd = float(vec_cmd[0]) - prev_manip_cmd
+            prev_pose = (
+                list(self._command_latched_pose_xytheta)
+                if isinstance(self._command_latched_pose_xytheta, list) and len(self._command_latched_pose_xytheta) >= 3
+                else list(pose_event)
+            )
+            if abs(delta_manip_cmd) > 1e-9:
+                current_shift = float(pose_event[0]) - float(prev_pose[0])
+                if abs(current_shift - delta_manip_cmd) > 1e-4:
+                    pose_event[0] = float(prev_pose[0] + delta_manip_cmd)
+                    self.command_base_pose_xytheta = [
+                        float(pose_event[0]),
+                        float(pose_event[1]),
+                        float(pose_event[2]),
+                    ]
+                    self.command_base_pose_last_wall_time = time.time()
+
+        self._record_command_event(
+            "execute_arm_to",
+            qpos10=q_event,
+            command_pose_xytheta=pose_event,
+            manip_base_x_cmd=float(vec_cmd[0]),
+        )
+        try:
+            res = rpc.request(
+                "execute_arm_to",
+                {
+                    "joint": [float(v) for v in vec_cmd.tolist()],
+                    "gripper": grip_cmd,
+                    "head": head_cmd,
+                    "blocking": bool(blocking),
+                    "timeout_s": float(timeout_s),
+                    "reliable": bool(reliable),
+                },
+                timeout_s=max(float(timeout_s) + 2.0, STRETCH_AI_RPC_TIMEOUT_S),
+            )
+            ok = bool(isinstance(res, dict) and res.get("ok", False))
+            with self._lock:
+                self._last_exec_result = dict(res) if isinstance(res, dict) else {"result": res}
+                if ok:
+                    # Keep local command targets aligned with the last successful arm_to pose
+                    # so the next manual increment starts from current robot posture.
+                    if self.qpos is None or len(self.qpos) < 10:
+                        actual_now = self.get_actual_qpos()
+                        self.qpos = list(actual_now[:10]) + [0.0] * max(0, 10 - len(actual_now)) if actual_now else ([0.0] * 10)
+                    # joint6 ordering is [base_x, lift, arm, wrist_yaw, wrist_pitch, wrist_roll].
+                    # qpos ordering is  [arm,    lift, wrist_yaw, wrist_pitch, wrist_roll, ...].
+                    # Keep manipulation base_x in its own field; do not write it into qpos[0].
+                    self._manip_base_x = float(np.clip(float(vec_cmd[0]), MANIP_BASE_X_LIMITS[0], MANIP_BASE_X_LIMITS[1]))
+                    self.qpos[0] = float(np.clip(float(vec_cmd[2]), self.JOINT_LIMITS[0][0], self.JOINT_LIMITS[0][1]))  # arm_extension
+                    self.qpos[1] = float(np.clip(float(vec_cmd[1]), self.JOINT_LIMITS[1][0], self.JOINT_LIMITS[1][1]))  # lift
+                    self.qpos[2] = float(np.clip(float(vec_cmd[3]), self.JOINT_LIMITS[2][0], self.JOINT_LIMITS[2][1]))  # wrist_yaw
+                    self.qpos[3] = float(np.clip(float(vec_cmd[4]), self.JOINT_LIMITS[3][0], self.JOINT_LIMITS[3][1]))  # wrist_pitch
+                    self.qpos[4] = float(np.clip(float(vec_cmd[5]), self.JOINT_LIMITS[4][0], self.JOINT_LIMITS[4][1]))  # wrist_roll
+                    if grip_cmd is not None:
+                        self.qpos[7] = float(np.clip(float(grip_cmd), self.JOINT_LIMITS[7][0], self.JOINT_LIMITS[7][1]))
+                    if isinstance(head_cmd, list) and len(head_cmd) >= 2:
+                        self.qpos[5] = float(np.clip(float(head_cmd[0]), self.JOINT_LIMITS[5][0], self.JOINT_LIMITS[5][1]))
+                        self.qpos[6] = float(np.clip(float(head_cmd[1]), self.JOINT_LIMITS[6][0], self.JOINT_LIMITS[6][1]))
+                    self.qpos[8] = 0.0
+                    self.qpos[9] = 0.0
+                    self.published_qpos = list(self.qpos)
+                    self._base_linear_cmd = 0.0
+                    self._base_angular_cmd = 0.0
+                    self._needs_mode_retry = False
+            if isinstance(res, dict) and res.get("status") == "accepted_stalled":
+                now = time.time()
+                if now - self._last_cmd_error_t > 2.0:
+                    self._last_cmd_error_t = now
+                    print(
+                        "[stretch_ai_bridge] execute_arm_to reported stalled-but-accepted; continuing.",
+                        file=sys.stderr,
+                    )
+            return ok
+        except Exception as exc:
+            now = time.time()
+            if now - self._last_cmd_error_t > 2.0:
+                self._last_cmd_error_t = now
+                print(f"[stretch_ai_bridge] execute_arm_to error: {exc}", file=sys.stderr)
+            return False
+        finally:
+            if bool(blocking):
+                self._refresh_state_from_ros_topic(
+                    require_newer_than_ns=pre_stamp_ns,
+                    timeout_s=0.60,
+                )
+            else:
+                self._refresh_state_from_ros_topic(timeout_s=0.0)
+
+    def sync_command_targets_to_actual(self) -> bool:
+        """Optionally reset local command targets to measured robot state."""
+        if not bool(ALLOW_COMMAND_SYNC_FROM_STATE):
+            with self._lock:
+                self._base_linear_cmd = 0.0
+                self._base_angular_cmd = 0.0
+                self._needs_mode_retry = False
+            return True
+
+        actual = self.get_actual_qpos()
+        if len(actual) < 10:
+            return False
+        with self._lock:
+            self.qpos = list(actual[:10])
+            self.qpos[8] = 0.0
+            self.qpos[9] = 0.0
+            self.published_qpos = list(self.qpos)
+            self._base_linear_cmd = 0.0
+            self._base_angular_cmd = 0.0
+            self._needs_mode_retry = False
+        return True
+
+    def sync_base_command_pose_to_observation(self) -> bool:
+        """Set command base pose x/y/theta to latest observed base pose."""
+        # Pull latest snapshots before syncing command targets.
+        self._refresh_state_from_ros_topic(timeout_s=0.2)
+        self._refresh_manip_base_x_from_worker()
+        measured = self.get_measured_base_pose_xytheta()
+        if not (isinstance(measured, list) and len(measured) >= 3):
+            return False
+        pose = [float(measured[0]), float(measured[1]), float(measured[2])]
+        with self._lock:
+            self.command_base_pose_xytheta = list(pose)
+            self.command_base_pose_last_wall_time = time.time()
+            q_event = list(self._command_latched_qpos10[:10]) if isinstance(self._command_latched_qpos10, list) else [0.0] * 10
+            if len(q_event) < 10:
+                q_event += [0.0] * (10 - len(q_event))
+            q_event[8] = 0.0
+            q_event[9] = 0.0
+            manip_cmd = float(self._manip_base_x)
+        self._record_command_event(
+            "sync_base_pose_to_obs",
+            qpos10=q_event,
+            command_pose_xytheta=pose,
+            manip_base_x_cmd=manip_cmd,
+        )
+        return True
+
+    def sync_nonbase_command_joints_to_observation(self) -> bool:
+        """Set command joints [0..7] to latest observed robot joints [0..7]."""
+        self._refresh_state_from_ros_topic(timeout_s=0.2)
+        self._refresh_manip_base_x_from_worker()
+        actual = self.get_actual_qpos()
+        if not (isinstance(actual, list) and len(actual) >= 8):
+            return False
+        with self._lock:
+            if self.qpos is None or len(self.qpos) < 10:
+                self.qpos = [0.0] * 10
+            if self.published_qpos is None or len(self.published_qpos) < 10:
+                self.published_qpos = [0.0] * 10
+            for i in range(8):
+                lo, hi = self.JOINT_LIMITS[i]
+                v = float(np.clip(float(actual[i]), float(lo), float(hi)))
+                self.qpos[i] = v
+                self.published_qpos[i] = v
+            self.qpos[8] = 0.0
+            self.qpos[9] = 0.0
+            self.published_qpos[8] = 0.0
+            self.published_qpos[9] = 0.0
+            self._base_linear_cmd = 0.0
+            self._base_angular_cmd = 0.0
+            self._needs_mode_retry = False
+
+            pose = (
+                list(self.command_base_pose_xytheta)
+                if isinstance(self.command_base_pose_xytheta, list) and len(self.command_base_pose_xytheta) >= 3
+                else [float(self._base_x), float(self._base_y), float(self._base_theta)]
+            )
+            q_event = [float(v) for v in self.qpos[:10]]
+            manip_cmd = float(self._manip_base_x)
+        self._record_command_event(
+            "sync_nonbase_joints_to_obs",
+            qpos10=q_event,
+            command_pose_xytheta=[float(pose[0]), float(pose[1]), float(pose[2])],
+            manip_base_x_cmd=manip_cmd,
+        )
+        return True
+
+    def _refresh_manip_base_x_from_worker(self) -> bool:
+        """Best-effort refresh of manipulation base_x from worker observe()."""
+        rpc = self._rpc
+        if rpc is None:
+            return False
+        try:
+            obs = rpc.request("observe", {}, timeout_s=max(1.0, 0.5 * STRETCH_AI_RPC_TIMEOUT_S))
+        except Exception:
+            return False
+        val = obs.get("manip_base_x") if isinstance(obs, dict) else None
+        if not isinstance(val, (int, float)):
+            return False
+        with self._lock:
+            self._manip_base_x = float(val)
+        return True
+
+    def plan_open_loop_grasp(
+        self,
+        object_xyz_global: tuple[float, float, float] | list[float] | np.ndarray,
+        *,
+        pregrasp_distance: float = IK_PREGRASP_DISTANCE_M,
+        lift_distance: float = IK_LIFT_DISTANCE_M,
+        wrist_yaw_target: float | None = None,
+        wrist_pitch_target: float | None = None,
+        wrist_roll_target: float | None = None,
+        timeout_s: float = 35.0,
+    ) -> dict[str, Any] | None:
+        """Request stretch_ai open-loop grasp IK targets for a world-frame point."""
+        rpc = self._rpc
+        if rpc is None:
+            return None
+        try:
+            res = rpc.request(
+                "plan_open_loop_grasp",
+                {
+                    "object_xyz_global": [
+                        float(object_xyz_global[0]),
+                        float(object_xyz_global[1]),
+                        float(object_xyz_global[2]),
+                    ],
+                    "pregrasp_distance": float(pregrasp_distance),
+                    "lift_distance": float(lift_distance),
+                    "wrist_yaw_target": None if wrist_yaw_target is None else float(wrist_yaw_target),
+                    "wrist_pitch_target": None if wrist_pitch_target is None else float(wrist_pitch_target),
+                    "wrist_roll_target": None if wrist_roll_target is None else float(wrist_roll_target),
+                },
+                timeout_s=max(float(timeout_s), STRETCH_AI_RPC_TIMEOUT_S),
+            )
+            return dict(res) if isinstance(res, dict) else {"ok": False, "error": "invalid plan response"}
+        except Exception as exc:
+            now = time.time()
+            if now - self._last_cmd_error_t > 2.0:
+                self._last_cmd_error_t = now
+                print(f"[stretch_ai_bridge] plan_open_loop_grasp error: {exc}", file=sys.stderr)
+            return {"ok": False, "error": str(exc)}
+
+    def rotate_base_relative_chunked(
+        self,
+        theta_rad: float,
+        *,
+        step_rad: float | None = None,
+        step_delay_s: float | None = None,
+    ) -> bool:
+        """Execute a relative rotation as equal small-angle sub-commands with delay."""
+        total = float(theta_rad)
+        if abs(total) < 1e-6:
+            return True
+
+        with self._lock:
+            sr = float(step_rad) if step_rad is not None else float(self.base_rotate_step_rad)
+            sd = float(step_delay_s) if step_delay_s is not None else float(self.base_rotate_step_delay_s)
+        sr = max(1e-4, abs(sr))
+        sd = float(np.clip(sd, 0.0, 0.5))
+
+        n = int(np.ceil(abs(total) / sr))
+        n = max(1, n)
+        step = total / float(n)
+        for i in range(n):
+            # Allocate a bounded timeout per chunk to avoid over-blocking on one failed step.
+            timeout_s = max(2.0, abs(step) * 8.0 + 1.5)
+            ok = self.rotate_base_relative(step, timeout_s=timeout_s)
+            if not ok:
+                return False
+            if i < (n - 1) and sd > 0.0:
+                time.sleep(sd)
+        return True
+
+    def set_command_smoothing_delay(self, delay_s: float) -> None:
+        self.command_smooth_delay_s = float(np.clip(float(delay_s), 0.01, 0.5))
+
+    def set_base_rotate_step_deg(self, step_deg: float) -> None:
+        self.base_rotate_step_rad = float(np.deg2rad(np.clip(float(step_deg), 5.8, 45.0)))
+
+    def set_base_rotate_step_delay(self, delay_s: float) -> None:
+        self.base_rotate_step_delay_s = float(np.clip(float(delay_s), 0.0, 0.5))
+
+    def _ensure_ros_topics_connected(self, timeout_s: float = ROS_TOPICS_CONNECT_TIMEOUT_S) -> None:
+        if _RCLPY_IMPORT_ERROR is not None:
+            raise RuntimeError(f"ROS2 observation imports unavailable: {_RCLPY_IMPORT_ERROR}")
+        client = self._ros_obs_client
+        if client is None:
+            client = RosTopicObservationClient()
+            self._ros_obs_client = client
+        if not client.connected:
+            client.connect(timeout_s=float(timeout_s))
+
+    def _try_connect_ros_topics(self, timeout_s: float = 1.0) -> tuple[bool, str | None]:
+        now = time.time()
+        client = self._ros_obs_client
+        if client is not None and client.connected:
+            return True, None
+        if now < float(self._next_ros_connect_t):
+            return False, "ROS topic reconnect backoff active"
+        try:
+            self._ensure_ros_topics_connected(timeout_s=float(timeout_s))
+            self._next_ros_connect_t = 0.0
+            return True, None
+        except Exception as exc:
+            self._next_ros_connect_t = now + 2.0
+            return False, str(exc)
+
+    def set_image_source(self, source: str) -> dict[str, Any]:
+        if FORCE_ROS_TOPIC_OBSERVATION:
+            with self._lock:
+                self._image_source = "ros_topic"
+            ok, err = self._try_connect_ros_topics(timeout_s=min(3.0, ROS_TOPICS_CONNECT_TIMEOUT_S))
+            if not ok:
+                return {"ok": False, "source": "ros_topic", "forced": True, "error": err}
+            return {"ok": True, "source": "ros_topic", "forced": True}
+
+        src = str(source).strip().lower()
+        if src in {"ros", "ros_topic", "ros_topics", "topic", "topics"}:
+            src = "ros_topic"
+        elif src in {"bridge", "worker"}:
+            src = "bridge"
+        else:
+            return {"ok": False, "error": f"Unknown image source {source!r}"}
+
+        with self._lock:
+            self._image_source = src
+
+        if src == "ros_topic":
+            ok, err = self._try_connect_ros_topics(timeout_s=min(3.0, ROS_TOPICS_CONNECT_TIMEOUT_S))
+            if not ok:
+                return {"ok": False, "source": src, "error": err}
+        return {"ok": True, "source": src}
+
+    def get_image_source(self) -> str:
+        if FORCE_ROS_TOPIC_OBSERVATION:
+            return "ros_topic"
+        with self._lock:
+            return str(self._image_source)
+
+    def head_image_rotated_90_cw(self) -> bool:
+        return bool(ROS_TOPICS_ROTATE_HEAD_90_CW)
+
+    def publish_hold_stop(self) -> None:
+        self.stop_base()
+        for _ in range(3):
+            self.publish_commands(force=True)
+            rpc = self._rpc
+            if rpc is not None:
+                try:
+                    rpc.request("stop_base", {}, timeout_s=2.0)
+                except Exception:
+                    pass
+            time.sleep(0.02)
+
+    def get_images(self):
+        source = self.get_image_source()
+        if source == "ros_topic":
+            self._try_connect_ros_topics(timeout_s=0.5)
+            client = self._ros_obs_client
+            if client is not None and client.connected:
+                hr, wr, hd, wd, _, _ = client.get_snapshot()
+                return hr, wr, hd, wd
+            return None, None, None, None
+
+        with self._lock:
+            hr = None if self.head_rgb is None else self.head_rgb.copy()
+            wr = None if self.wrist_rgb is None else self.wrist_rgb.copy()
+            hd = None if self.head_depth is None else self.head_depth.copy()
+            wd = None if self.wrist_depth is None else self.wrist_depth.copy()
+        return hr, wr, hd, wd
+
+    def get_actual_qpos(self):
+        source = self.get_image_source()
+        if source == "ros_topic":
+            self._try_connect_ros_topics(timeout_s=0.5)
+            client = self._ros_obs_client
+            if client is not None and client.connected:
+                obs = client.get_observation_snapshot()
+                actual = obs.get("actual_qpos")
+                if isinstance(actual, list) and len(actual) > 0:
+                    out = [float(v) for v in actual[:10]]
+                    if len(out) < 10:
+                        out += [0.0] * (10 - len(out))
+                    return out
+            return []
+
+        with self._lock:
+            if self.actual_qpos is not None:
+                return list(self.actual_qpos)
+        return []
+
+    def get_published_qpos(self):
+        with self._lock:
+            if self.published_qpos is not None:
+                return list(self.published_qpos)
+            if self.qpos is not None:
+                return list(self.qpos)
+        return []
+
+    def get_target_qpos(self):
+        with self._lock:
+            if self.qpos is not None:
+                return list(self.qpos)
+        return []
+
+    def is_base_command_active(self, threshold: float = 1e-3) -> bool:
+        with self._lock:
+            return (
+                abs(float(self._base_linear_cmd)) > float(threshold)
+                or abs(float(self._base_angular_cmd)) > float(threshold)
+            )
+
+    def has_pending_command(self, eps: float = 1e-4) -> bool:
+        with self._lock:
+            if self._needs_mode_retry:
+                return True
+            if self.qpos is None:
+                return False
+            if self.published_qpos is None:
+                return True
+            n = min(len(self.qpos), len(self.published_qpos))
+            if n == 0:
+                return False
+            for i in range(n):
+                if abs(float(self.qpos[i]) - float(self.published_qpos[i])) > float(eps):
+                    return True
+            return len(self.qpos) != len(self.published_qpos)
+
+    def get_measured_base_pose_xytheta(self):
+        source = self.get_image_source()
+        if source == "ros_topic":
+            self._try_connect_ros_topics(timeout_s=0.5)
+            client = self._ros_obs_client
+            if client is not None and client.connected:
+                obs = client.get_observation_snapshot()
+                pose = obs.get("base_pose_xytheta")
+                if isinstance(pose, list) and len(pose) >= 3:
+                    return [float(pose[0]), float(pose[1]), float(pose[2])]
+            # Do not fall back to zeros: that can corrupt queued goal world anchoring.
+            with self._lock:
+                return [float(self._base_x), float(self._base_y), float(self._base_theta)]
+
+        with self._lock:
+            return [float(self._base_x), float(self._base_y), float(self._base_theta)]
+
+    def get_command_base_pose_xytheta(self):
+        with self._lock:
+            if self.command_base_pose_xytheta is not None:
+                return list(self.command_base_pose_xytheta)
+            return [float(self._base_x), float(self._base_y), float(self._base_theta)]
+
+    @property
+    def camera_info(self):
+        source = self.get_image_source()
+        if source == "ros_topic":
+            self._try_connect_ros_topics(timeout_s=0.5)
+            client = self._ros_obs_client
+            if client is not None and client.connected:
+                _, _, _, _, head_info, _ = client.get_snapshot()
+                if head_info is not None:
+                    return _CameraInfoCompat(head_info)
+            return None
+
+        with self._lock:
+            raw = dict(self._camera_info_head) if self._camera_info_head is not None else None
+        return _CameraInfoCompat(raw) if raw is not None else None
+
+    def get_clock(self):
+        source = self.get_image_source()
+        if source == "ros_topic":
+            client = self._ros_obs_client
+            if client is not None and client.connected:
+                return client.get_clock()
+        return self._clock
+
+    def lookup_transform(self, target_frame: str, source_frame: str, *args, **kwargs):
+        source = self.get_image_source()
+        if source == "ros_topic":
+            self._try_connect_ros_topics(timeout_s=0.5)
+            client = self._ros_obs_client
+            if client is None or not client.connected:
+                raise RuntimeError("ROS2 topic observation client is not connected")
+            timeout_s = 1.0
+            timeout_obj = kwargs.get("timeout")
+            if timeout_obj is not None:
+                try:
+                    if hasattr(timeout_obj, "nanoseconds"):
+                        timeout_s = max(0.05, float(timeout_obj.nanoseconds) / 1e9)
+                    elif hasattr(timeout_obj, "seconds"):
+                        timeout_s = max(0.05, float(timeout_obj.seconds))
+                    elif isinstance(timeout_obj, (int, float)):
+                        timeout_s = max(0.05, float(timeout_obj))
+                except Exception:
+                    timeout_s = 1.0
+            return client.lookup_transform(target_frame, source_frame, timeout_s=timeout_s)
+
+        rpc = self._rpc
+        if rpc is None:
+            raise RuntimeError("Bridge worker is not connected")
+        tf = rpc.request(
+            "lookup_transform",
+            {"target_frame": str(target_frame), "source_frame": str(source_frame)},
+            timeout_s=max(2.0, STRETCH_AI_RPC_TIMEOUT_S),
+        )
+        return _transform_dict_to_msg(tf)
+
+    def pixel_to_3d_point(self, pixel_x: int, pixel_y: int, depth: float):
+        cam = self.camera_info
+        if cam is None:
+            return None
+        fx = float(cam.k[0])
+        fy = float(cam.k[4])
+        cx = float(cam.k[2])
+        cy = float(cam.k[5])
+        if fx == 0.0 or fy == 0.0:
+            return None
+
+        # Keep mapping consistent with active image source orientation.
+        if self.head_image_rotated_90_cw():
+            original_x = float(pixel_y)
+            original_y = float(cam.height - 1 - pixel_x)
+        else:
+            original_x = float(pixel_x)
+            original_y = float(pixel_y)
+
+        pt = PointStamped()
+        pt.header.frame_id = "camera_color_optical_frame"
+        pt.header.stamp = self.get_clock().now().to_msg()
+        pt.point.x = float((original_x - cx) * float(depth) / fx)
+        pt.point.y = float((original_y - cy) * float(depth) / fy)
+        pt.point.z = float(depth)
+        return pt
+
+    def transform_point_to_base(self, point_stamped: PointStamped):
+        try:
+            tf_msg = self.lookup_transform("base_link", point_stamped.header.frame_id)
+        except Exception as exc:
+            print(f"[stretch_ai_bridge] transform lookup failed: {exc}", file=sys.stderr)
+            return None
+        return _apply_transform_point(point_stamped, tf_msg)
+
+    def get_aligned_record_components(self) -> dict[str, Any]:
+        """Return ROS-time aligned observation/command components for one record row."""
+        self._try_connect_ros_topics(timeout_s=0.5)
+        client = self._ros_obs_client
+        if client is None or not client.connected:
+            raise RuntimeError("ROS topic observation client is not connected")
+
+        head_rgb, wrist_rgb, head_depth, wrist_depth, _, _ = client.get_snapshot()
+        timing = client.get_timing_snapshot()
+        stamp_map = timing.get("stamp_ns") if isinstance(timing.get("stamp_ns"), dict) else {}
+        ref_stamp_ns = (
+            stamp_map.get("head_rgb")
+            or stamp_map.get("head_depth")
+            or stamp_map.get("wrist_rgb")
+            or stamp_map.get("wrist_depth")
+        )
+        aligned_obs = client.get_aligned_observation_snapshot(reference_stamp_ns=ref_stamp_ns)
+
+        actual = aligned_obs.get("actual_qpos")
+        if not isinstance(actual, list):
+            actual = self.get_actual_qpos()
+        actual10 = [float(v) for v in actual[:10]] + [0.0] * max(0, 10 - len(actual))
+
+        pose = aligned_obs.get("base_pose_xytheta")
+        if not (isinstance(pose, list) and len(pose) >= 3):
+            pose = self.get_measured_base_pose_xytheta()
+        measured_pose = [float(pose[0]), float(pose[1]), float(pose[2])]
+
+        cmd_event = self._select_command_event(ref_stamp_ns)
+        if cmd_event is not None:
+            cmd_qpos = [float(v) for v in cmd_event.get("qpos10", [])[:10]]
+            cmd_qpos += [0.0] * max(0, 10 - len(cmd_qpos))
+            cmd_pose = cmd_event.get("command_pose_xytheta")
+            if not (isinstance(cmd_pose, list) and len(cmd_pose) >= 3):
+                cmd_pose = self.get_command_base_pose_xytheta()
+            command_pose = [float(cmd_pose[0]), float(cmd_pose[1]), float(cmd_pose[2])]
+            manip_base_x_cmd = cmd_event.get("manip_base_x_cmd")
+            if isinstance(manip_base_x_cmd, (int, float)):
+                manip_base_x_cmd = float(manip_base_x_cmd)
+            else:
+                manip_base_x_cmd = float(self._manip_base_x)
+        else:
+            cmd_raw = self.get_published_qpos()
+            cmd_qpos = [float(v) for v in cmd_raw[:10]] + [0.0] * max(0, 10 - len(cmd_raw))
+            cpose = self.get_command_base_pose_xytheta()
+            command_pose = [float(cpose[0]), float(cpose[1]), float(cpose[2])]
+            manip_base_x_cmd = float(self._manip_base_x)
+
+        return {
+            "timestamp": (float(ref_stamp_ns) / 1e9) if isinstance(ref_stamp_ns, int) else time.time(),
+            "reference_stamp_ns": ref_stamp_ns if isinstance(ref_stamp_ns, int) else None,
+            "aligned_joint_stamp_ns": aligned_obs.get("aligned_joint_stamp_ns"),
+            "aligned_odom_stamp_ns": aligned_obs.get("aligned_odom_stamp_ns"),
+            "stamp_ns_map": stamp_map if isinstance(stamp_map, dict) else {},
+            "actual_qpos10": actual10,
+            "measured_pose_xytheta": measured_pose,
+            "command_qpos10": cmd_qpos,
+            "command_pose_xytheta": command_pose,
+            "command_manip_base_x": manip_base_x_cmd,
+            "head_rgb": head_rgb,
+            "wrist_rgb": wrist_rgb,
+            "head_depth": head_depth,
+            "wrist_depth": wrist_depth,
+            "command_event": cmd_event,
+        }
+
+    def get_sensor_snapshot(self):
+        source = self.get_image_source()
+        with self._lock:
+            qpos = list(self.qpos) if self.qpos is not None else []
+            published = list(self.published_qpos) if self.published_qpos is not None else []
+            base_pose_bridge = [float(self._base_x), float(self._base_y), float(self._base_theta)]
+            command_pose = (
+                list(self.command_base_pose_xytheta)
+                if self.command_base_pose_xytheta is not None
+                else list(base_pose_bridge)
+            )
+            actual_bridge = list(self.actual_qpos) if self.actual_qpos is not None else []
+            jp_bridge = list(self._joint_positions) if self._joint_positions is not None else []
+            jv_bridge = list(self._joint_velocities) if self._joint_velocities is not None else []
+            je_bridge = list(self._joint_efforts) if self._joint_efforts is not None else []
+            head_info_bridge = dict(self._camera_info_head) if self._camera_info_head is not None else None
+            wrist_info_bridge = dict(self._camera_info_wrist) if self._camera_info_wrist is not None else None
+            mode = self._mode
+            at_goal = self._at_goal
+            is_homed = self._is_homed
+            is_runstopped = self._is_runstopped
+
+        if source == "ros_topic":
+            self._try_connect_ros_topics(timeout_s=0.5)
+            client = self._ros_obs_client
+            obs = client.get_observation_snapshot() if client is not None and client.connected else {}
+            actual = obs.get("actual_qpos")
+            if not isinstance(actual, list):
+                actual = []
+            base_pose = obs.get("base_pose_xytheta")
+            if not (isinstance(base_pose, list) and len(base_pose) >= 3):
+                base_pose = [0.0, 0.0, 0.0]
+            joint_names = obs.get("joint_state_name")
+            if not isinstance(joint_names, list):
+                joint_names = list(self.JOINT_STATE_NAMES)
+            jp = obs.get("joint_state_position")
+            if not isinstance(jp, list):
+                jp = []
+            jv = obs.get("joint_state_velocity")
+            if not isinstance(jv, list):
+                jv = []
+            je = obs.get("joint_state_effort")
+            if not isinstance(je, list):
+                je = []
+            imu_mobile = obs.get("imu_mobile")
+            imu_wrist = obs.get("imu_wrist")
+            imu_cam_accel = obs.get("imu_cam_accel")
+            imu_cam_gyro = obs.get("imu_cam_gyro")
+            mag_mobile = obs.get("mag_mobile")
+            battery = obs.get("battery")
+            odom = obs.get("odom")
+            if not isinstance(odom, dict):
+                odom = {
+                    "position": [base_pose[0], base_pose[1], 0.0],
+                    "orientation": [0.0, 0.0, np.sin(base_pose[2] / 2.0), np.cos(base_pose[2] / 2.0)],
+                    "linear_velocity": [float(actual[8]) if len(actual) > 8 else 0.0, 0.0, 0.0],
+                    "angular_velocity": [0.0, 0.0, float(actual[9]) if len(actual) > 9 else 0.0],
+                }
+            _, _, _, _, head_info, wrist_info = (
+                client.get_snapshot() if client is not None and client.connected else (None, None, None, None, None, None)
+            )
+            stamp_ns_map = obs.get("stamp_ns") if isinstance(obs.get("stamp_ns"), dict) else {}
+            recv_wall_ns_map = obs.get("recv_wall_ns") if isinstance(obs.get("recv_wall_ns"), dict) else {}
+            ros_minus_wall_ns = obs.get("ros_minus_wall_ns")
+        else:
+            actual = actual_bridge
+            base_pose = base_pose_bridge
+            joint_names = list(self.JOINT_STATE_NAMES)
+            jp = jp_bridge
+            jv = jv_bridge
+            je = je_bridge
+            imu_mobile = None
+            imu_wrist = None
+            imu_cam_accel = None
+            imu_cam_gyro = None
+            mag_mobile = None
+            battery = None
+            odom = {
+                "position": [base_pose[0], base_pose[1], 0.0],
+                "orientation": [0.0, 0.0, np.sin(base_pose[2] / 2.0), np.cos(base_pose[2] / 2.0)],
+                "linear_velocity": [float(actual[8]) if len(actual) > 8 else 0.0, 0.0, 0.0],
+                "angular_velocity": [0.0, 0.0, float(actual[9]) if len(actual) > 9 else 0.0],
+            }
+            head_info = head_info_bridge
+            wrist_info = wrist_info_bridge
+            stamp_ns_map = {}
+            recv_wall_ns_map = {}
+            ros_minus_wall_ns = None
+
+        return {
+            "observation.qpos_full": qpos,
+            "observation.qpos_actual": actual,
+            "observation.base_pose_xytheta": base_pose,
+            "observation.command_base_pose_xytheta": command_pose,
+            "observation.joint_state.name": joint_names,
+            "observation.joint_state.position": jp,
+            "observation.joint_state.velocity": jv,
+            "observation.joint_state.effort": je,
+            "observation.imu.mobile_base": imu_mobile,
+            "observation.imu.wrist": imu_wrist,
+            "observation.imu.camera_accel": imu_cam_accel,
+            "observation.imu.camera_gyro": imu_cam_gyro,
+            "observation.magnetometer.mobile_base": mag_mobile,
+            "observation.battery": battery,
+            "observation.odom": odom,
+            "observation.camera_info.head": head_info,
+            "observation.camera_info.wrist": wrist_info,
+            "observation.bridge.control_mode": mode,
+            "observation.bridge.at_goal": at_goal,
+            "observation.bridge.is_homed": is_homed,
+            "observation.bridge.is_runstopped": is_runstopped,
+            "observation.qpos_published": published,
+            "observation.images.source": source,
+            "observation.sync.stamp_ns": stamp_ns_map,
+            "observation.sync.recv_wall_ns": recv_wall_ns_map,
+            "observation.sync.ros_minus_wall_ns": ros_minus_wall_ns,
+        }
+
+    def is_ready(self):
+        actual = self.get_actual_qpos()
+        with self._lock:
+            return self.qpos is not None and len(actual) > 0
+
+    def close(self) -> None:
+        client = self._ros_obs_client
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
+            self._ros_obs_client = None
+
+        self._stop_event.set()
+        if self._poll_thread is not None and self._poll_thread.is_alive():
+            self._poll_thread.join(timeout=2.0)
+        if self._command_thread is not None and self._command_thread.is_alive():
+            self._command_thread.join(timeout=2.0)
+        if self._rpc is not None:
+            self._rpc.close()
+            self._rpc = None
+
+
+###############################################################################
+# UI
+###############################################################################
+class RobotTeleopBridgeUI(QMainWindow):
+    TABLE_JOINT_NAMES = [
+        "arm_extension",
+        "arm_lift",
+        "wrist_yaw",
+        "wrist_pitch",
+        "wrist_roll",
+        "head_pan",
+        "head_tilt",
+        "gripper",
+        "base_x",
+        "base_y",
+        "base_theta",
+    ]
+
+    def __init__(self, ros_node: StretchAIDemoBridge):
+        super().__init__()
+        self.ros_node = ros_node
+        self.image_source = "bridge"
+        if hasattr(self.ros_node, "get_image_source"):
+            try:
+                self.image_source = str(self.ros_node.get_image_source())
+            except Exception:
+                self.image_source = "bridge"
+
+        self.head_rgb = None
+        self.wrist_rgb = None
+        self.depth_image = None
+        self.wrist_depth = None
+
+        # Base manual controls use per-tick relative chunks (dx in meters, dtheta in degrees).
+        self.base_linear_step_m = 0.03
+        self.base_theta_step_deg = 4.0
+        self.arm_speed = 0.01
+        self.head_speed = 0.05
+        self.wrist_speed = 0.05
+        self.gripper_step = 0.03
+        self.command_smoothing_delay_s = float(self.ros_node.command_smooth_delay_s)
+
+        self.dataset_root = DEFAULT_DATASET_ROOT
+        self.record_prompt = ""
+        self.record_rgb_format = str(DEMO_RECORD_RGB_DEFAULT_FORMAT).lower()
+        self.record_rgb_jpeg_quality = int(DEMO_RECORD_RGB_JPEG_QUALITY)
+        self.is_recording_demo = False
+        self.demo_recorder = LeRobotStyleRecorder(robot_type="stretch3", target_fps=DEMO_RECORD_FPS)
+
+        self._active_increments: dict[str, float] = {}
+
+        self._init_ui()
+
+        self._control_timer = QTimer(self)
+        self._control_timer.timeout.connect(self._control_tick)
+        self._control_timer.start(max(10, int(round(self.command_smoothing_delay_s * 1000.0))))
+
+        self._ui_timer = QTimer(self)
+        self._ui_timer.timeout.connect(self._refresh)
+        self._ui_timer.start(UI_REFRESH_MS)
+
+    def _init_ui(self):
+        self.setWindowTitle("Robot Teleop + Recording (stretch_ai bridge)")
+        self.resize(1700, 960)
+
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QHBoxLayout(central)
+
+        left = QVBoxLayout()
+        root.addLayout(left, stretch=4)
+
+        cams = QGroupBox("RGB Cameras")
+        cams_layout = QGridLayout(cams)
+        self.head_label = QLabel("Waiting for head RGB...")
+        self.wrist_label = QLabel("Waiting for wrist RGB...")
+        for lbl in (self.head_label, self.wrist_label):
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lbl.setStyleSheet("background: #111; color: #ddd;")
+            lbl.setMinimumSize(760, 430)
+        cams_layout.addWidget(self.head_label, 0, 0)
+        cams_layout.addWidget(self.wrist_label, 0, 1)
+        left.addWidget(cams, stretch=3)
+
+        mon = QGroupBox("Joint State (Command vs Measured)")
+        mon_layout = QVBoxLayout(mon)
+        self.state_table = QTableWidget(len(self.TABLE_JOINT_NAMES), 3)
+        self.state_table.setHorizontalHeaderLabels(["Joint", "Command", "Measured"])
+        self.state_table.verticalHeader().setVisible(False)
+        self.state_table.setAlternatingRowColors(True)
+        self.state_table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        self.state_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.state_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.state_table.setMaximumHeight(320)
+        self.state_table.setColumnWidth(0, 150)
+        self.state_table.setColumnWidth(1, 130)
+        self.state_table.setColumnWidth(2, 130)
+        self.state_table.horizontalHeader().setStretchLastSection(True)
+        for row, name in enumerate(self.TABLE_JOINT_NAMES):
+            self.state_table.setItem(row, 0, QTableWidgetItem(name))
+            self.state_table.setItem(row, 1, QTableWidgetItem("--"))
+            self.state_table.setItem(row, 2, QTableWidgetItem("--"))
+        mon_layout.addWidget(self.state_table)
+        left.addWidget(mon, stretch=1)
+
+        ctrl = QVBoxLayout()
+        root.addLayout(ctrl, stretch=2)
+
+        ctrl.addWidget(self._build_smoothing_controls())
+        ctrl.addWidget(self._build_base_controls())
+        ctrl.addWidget(self._build_arm_controls())
+        ctrl.addWidget(self._build_head_controls())
+        ctrl.addWidget(self._build_wrist_controls())
+        ctrl.addWidget(self._build_gripper_controls())
+
+        stop_btn = QPushButton("STOP / HOLD")
+        stop_btn.setMinimumHeight(42)
+        stop_btn.setStyleSheet("QPushButton { background: #d32f2f; color: white; font-weight: bold; }")
+        stop_btn.clicked.connect(self._on_stop)
+        ctrl.addWidget(stop_btn)
+
+        rec = QGroupBox("LeRobot Demo Recording")
+        rec_layout = QGridLayout(rec)
+        rec_layout.addWidget(QLabel("Prompt"), 0, 0)
+        self.prompt_input = QLineEdit()
+        self.prompt_input.setPlaceholderText("e.g. pick up the red block and place it in the tray")
+        self.prompt_input.textChanged.connect(self.on_prompt_changed)
+        rec_layout.addWidget(self.prompt_input, 0, 1, 1, 2)
+
+        rec_layout.addWidget(QLabel("Folder"), 1, 0)
+        self.record_folder_input = QLineEdit(self.dataset_root)
+        self.record_folder_input.textChanged.connect(self.on_record_folder_changed)
+        rec_layout.addWidget(self.record_folder_input, 1, 1)
+
+        browse_btn = QPushButton("Browse")
+        browse_btn.clicked.connect(self.browse_record_folder)
+        rec_layout.addWidget(browse_btn, 1, 2)
+
+        rec_layout.addWidget(QLabel("RGB Format"), 2, 0)
+        self.record_rgb_format_combo = QComboBox()
+        self.record_rgb_format_combo.addItems(["jpg", "png"])
+        self.record_rgb_format_combo.setCurrentText(self.record_rgb_format)
+        self.record_rgb_format_combo.currentTextChanged.connect(self.on_record_rgb_format_changed)
+        rec_layout.addWidget(self.record_rgb_format_combo, 2, 1, 1, 2)
+
+        self.record_toggle_button = QPushButton("Record")
+        self.record_toggle_button.clicked.connect(self.toggle_demo_recording)
+        rec_layout.addWidget(self.record_toggle_button, 3, 0, 1, 3)
+
+        self.status_label = QLabel("Idle")
+        self.status_label.setWordWrap(True)
+        rec_layout.addWidget(self.status_label, 4, 0, 1, 3)
+
+        self.fps_label = QLabel("FPS: --")
+        rec_layout.addWidget(self.fps_label, 5, 0, 1, 3)
+        root.addWidget(rec, stretch=1)
+
+    def _make_speed_slider(
+        self,
+        *,
+        min_val: float,
+        max_val: float,
+        default_val: float,
+        on_change,
+        label_text: str = "Step Size",
+    ):
+        row = QHBoxLayout()
+        label = QLabel(label_text)
+        label.setFixedWidth(72)
+        row.addWidget(label)
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setRange(0, 100)
+        pos = int((default_val - min_val) / (max_val - min_val) * 100)
+        slider.setValue(int(np.clip(pos, 0, 100)))
+        value_label = QLabel(f"{default_val:.3f}")
+        value_label.setFixedWidth(52)
+
+        def _handle(v: int):
+            value = min_val + (max_val - min_val) * (v / 100.0)
+            value_label.setText(f"{value:.3f}")
+            on_change(value)
+
+        slider.valueChanged.connect(_handle)
+        row.addWidget(slider)
+        row.addWidget(value_label)
+        return row
+
+    def _build_smoothing_controls(self):
+        group = QGroupBox("Command Smoothing")
+        layout = QVBoxLayout(group)
+        layout.addWidget(QLabel("Delay between small command steps (seconds)"))
+        layout.addLayout(
+            self._make_speed_slider(
+                min_val=0.20,
+                max_val=0.01,
+                default_val=self.command_smoothing_delay_s,
+                on_change=self._on_smoothing_delay_changed,
+                label_text="Speed"
+            )
+        )
+        return group
+
+    def _on_smoothing_delay_changed(self, delay_s: float):
+        self.command_smoothing_delay_s = float(np.clip(delay_s, 0.01, 0.5))
+        self.ros_node.set_command_smoothing_delay(self.command_smoothing_delay_s)
+        self._control_timer.setInterval(max(10, int(round(self.command_smoothing_delay_s * 1000.0))))
+
+    def _bind_hold_button(self, *, button: QPushButton, control_name: str, sign: float, speed_attr: str):
+        button.pressed.connect(lambda: self._start_increment(control_name, sign * float(getattr(self, speed_attr))))
+        button.released.connect(lambda: self._stop_increment(control_name))
+
+    def _build_base_controls(self):
+        group = QGroupBox("Base")
+        layout = QGridLayout(group)
+
+        btn_fwd = QPushButton("Forward")
+        btn_left = QPushButton("Turn Left")
+        btn_back = QPushButton("Backward")
+        btn_right = QPushButton("Turn Right")
+
+        btn_fwd.pressed.connect(lambda: self._set_base(+self.base_linear_step_m, 0.0))
+        btn_fwd.released.connect(self._stop_base)
+        btn_back.pressed.connect(lambda: self._set_base(-self.base_linear_step_m, 0.0))
+        btn_back.released.connect(self._stop_base)
+        btn_left.pressed.connect(lambda: self._set_base(0.0, +self.base_theta_step_deg))
+        btn_left.released.connect(self._stop_base)
+        btn_right.pressed.connect(lambda: self._set_base(0.0, -self.base_theta_step_deg))
+        btn_right.released.connect(self._stop_base)
+
+        layout.addWidget(btn_fwd, 0, 1)
+        layout.addWidget(btn_left, 1, 0)
+        layout.addWidget(btn_back, 1, 1)
+        layout.addWidget(btn_right, 1, 2)
+
+        layout.addLayout(
+            self._make_speed_slider(
+                min_val=0.005,
+                max_val=0.20,
+                default_val=self.base_linear_step_m,
+                on_change=lambda v: setattr(self, "base_linear_step_m", v),
+                label_text="Linear Step",
+            ),
+            2, 0, 1, 3,
+        )
+        layout.addLayout(
+            self._make_speed_slider(
+                min_val=5.8,
+                max_val=20.0,
+                default_val=self.base_theta_step_deg,
+                on_change=lambda v: setattr(self, "base_theta_step_deg", v),
+                label_text="Rotation Step",
+            ),
+            3, 0, 1, 3,
+        )
+
+        layout.addWidget(QLabel("Move (cm)"), 4, 0)
+        self.base_distance_cm_input = QLineEdit("0")
+        self.base_distance_cm_input.setPlaceholderText("+100 / -100")
+        move_btn = QPushButton("Move Distance")
+        move_btn.clicked.connect(self._move_base_distance_from_input)
+        layout.addWidget(self.base_distance_cm_input, 4, 1)
+        layout.addWidget(move_btn, 4, 2)
+        return group
+
+    def _move_base_distance_from_input(self) -> None:
+        text = self.base_distance_cm_input.text().strip()
+        if not text:
+            return
+        try:
+            dist_cm = float(text)
+        except ValueError:
+            self.status_label.setText("Base move requires numeric cm value")
+            return
+
+        dx_m = dist_cm / 100.0
+        if abs(dx_m) < 1e-6:
+            return
+
+        try:
+            self.ros_node.stop_base()
+            ok = self.ros_node.move_base_relative(
+                dx=dx_m,
+                dy=0.0,
+                dtheta=0.0,
+                blocking=False,
+                timeout_s=max(2.0, 4.0 + abs(dx_m) * 6.0),
+            )
+            self.status_label.setText(
+                f"Base move command {dx_m:+.3f} m ({'sent' if ok else 'failed'})"
+            )
+        except Exception as exc:
+            self.status_label.setText(f"Base move failed: {exc}")
+
+    def _build_arm_controls(self):
+        group = QGroupBox("Arm (Lift / Stretch)")
+        layout = QGridLayout(group)
+        b1 = QPushButton("Lift +")
+        b2 = QPushButton("Lift -")
+        b3 = QPushButton("Stretch +")
+        b4 = QPushButton("Stretch -")
+
+        self._bind_hold_button(button=b1, control_name="arm_lift", sign=+1.0, speed_attr="arm_speed")
+        self._bind_hold_button(button=b2, control_name="arm_lift", sign=-1.0, speed_attr="arm_speed")
+        self._bind_hold_button(button=b3, control_name="arm_extension", sign=+1.0, speed_attr="arm_speed")
+        self._bind_hold_button(button=b4, control_name="arm_extension", sign=-1.0, speed_attr="arm_speed")
+
+        layout.addWidget(b1, 0, 0)
+        layout.addWidget(b2, 0, 1)
+        layout.addWidget(b3, 1, 0)
+        layout.addWidget(b4, 1, 1)
+        layout.addLayout(
+            self._make_speed_slider(min_val=0.002, max_val=0.05, default_val=self.arm_speed,
+                                    on_change=lambda v: setattr(self, "arm_speed", v)),
+            2, 0, 1, 2,
+        )
+        return group
+
+    def _build_head_controls(self):
+        group = QGroupBox("Head")
+        layout = QGridLayout(group)
+        b1 = QPushButton("Pan +")
+        b2 = QPushButton("Pan -")
+        b3 = QPushButton("Tilt +")
+        b4 = QPushButton("Tilt -")
+
+        self._bind_hold_button(button=b1, control_name="head_pan", sign=+1.0, speed_attr="head_speed")
+        self._bind_hold_button(button=b2, control_name="head_pan", sign=-1.0, speed_attr="head_speed")
+        self._bind_hold_button(button=b3, control_name="head_tilt", sign=+1.0, speed_attr="head_speed")
+        self._bind_hold_button(button=b4, control_name="head_tilt", sign=-1.0, speed_attr="head_speed")
+
+        layout.addWidget(b1, 0, 0)
+        layout.addWidget(b2, 0, 1)
+        layout.addWidget(b3, 1, 0)
+        layout.addWidget(b4, 1, 1)
+        layout.addLayout(
+            self._make_speed_slider(min_val=0.01, max_val=0.30, default_val=self.head_speed,
+                                    on_change=lambda v: setattr(self, "head_speed", v)),
+            2, 0, 1, 2,
+        )
+        return group
+
+    def _build_wrist_controls(self):
+        group = QGroupBox("Wrist")
+        layout = QGridLayout(group)
+        b1 = QPushButton("Yaw +")
+        b2 = QPushButton("Yaw -")
+        b3 = QPushButton("Pitch +")
+        b4 = QPushButton("Pitch -")
+        b5 = QPushButton("Roll +")
+        b6 = QPushButton("Roll -")
+
+        self._bind_hold_button(button=b1, control_name="wrist_yaw", sign=+1.0, speed_attr="wrist_speed")
+        self._bind_hold_button(button=b2, control_name="wrist_yaw", sign=-1.0, speed_attr="wrist_speed")
+        self._bind_hold_button(button=b3, control_name="wrist_pitch", sign=+1.0, speed_attr="wrist_speed")
+        self._bind_hold_button(button=b4, control_name="wrist_pitch", sign=-1.0, speed_attr="wrist_speed")
+        self._bind_hold_button(button=b5, control_name="wrist_roll", sign=+1.0, speed_attr="wrist_speed")
+        self._bind_hold_button(button=b6, control_name="wrist_roll", sign=-1.0, speed_attr="wrist_speed")
+
+        layout.addWidget(b1, 0, 0)
+        layout.addWidget(b2, 0, 1)
+        layout.addWidget(b3, 1, 0)
+        layout.addWidget(b4, 1, 1)
+        layout.addWidget(b5, 2, 0)
+        layout.addWidget(b6, 2, 1)
+        layout.addLayout(
+            self._make_speed_slider(min_val=0.01, max_val=0.30, default_val=self.wrist_speed,
+                                    on_change=lambda v: setattr(self, "wrist_speed", v)),
+            3, 0, 1, 2,
+        )
+        return group
+
+    def _build_gripper_controls(self):
+        group = QGroupBox("Gripper")
+        layout = QGridLayout(group)
+        open_btn = QPushButton("Open +")
+        close_btn = QPushButton("Close -")
+        open_btn.clicked.connect(lambda: self._gripper_step(+1.0))
+        close_btn.clicked.connect(lambda: self._gripper_step(-1.0))
+        layout.addWidget(open_btn, 0, 0)
+        layout.addWidget(close_btn, 0, 1)
+        layout.addLayout(
+            self._make_speed_slider(min_val=0.005, max_val=0.10, default_val=self.gripper_step,
+                                    on_change=lambda v: setattr(self, "gripper_step", v)),
+            1, 0, 1, 2,
+        )
+        return group
+
+    def _set_base(self, linear_step_m: float, theta_step_deg: float):
+        self.ros_node.set_control("base_linear", float(linear_step_m))
+        self.ros_node.set_control("base_angular", float(np.deg2rad(theta_step_deg)))
+
+    def _stop_base(self):
+        self.ros_node.stop_base()
+
+    def _start_increment(self, control_name: str, delta: float):
+        # Safety: if a base command is still latched, stop it before starting
+        # any non-base hold control. This prevents staying in navigation mode.
+        if control_name not in ("base_linear", "base_angular") and self.ros_node.is_base_command_active():
+            self.ros_node.stop_base()
+        self._active_increments[control_name] = float(delta)
+
+    def _stop_increment(self, control_name: str):
+        self._active_increments.pop(control_name, None)
+
+    def _gripper_step(self, sign: float):
+        if self.ros_node.is_base_command_active():
+            self.ros_node.stop_base()
+        self.ros_node.adjust_control("gripper", sign * self.gripper_step)
+
+    def _on_stop(self):
+        self._active_increments.clear()
+        self.ros_node.publish_hold_stop()
+        self.status_label.setText("STOP/HOLD published")
+
+    def _control_tick(self):
+        for control_name, delta in list(self._active_increments.items()):
+            self.ros_node.adjust_control(control_name, delta)
+        pending = self.ros_node.has_pending_command()
+        hold_active = bool(self._active_increments)
+        # Publish only for arm/head/wrist/gripper holds or pending joint smoothing deltas.
+        # Base streaming is handled independently by move_base_relative() in command-loop.
+        if hold_active or pending:
+            self.ros_node.publish_commands(force=False)
+
+    def on_prompt_changed(self, text):
+        self.record_prompt = text
+
+    def on_record_folder_changed(self, text):
+        self.dataset_root = text.strip()
+
+    def on_record_rgb_format_changed(self, text):
+        fmt = str(text or DEMO_RECORD_RGB_DEFAULT_FORMAT).strip().lower()
+        if fmt == "jpeg":
+            fmt = "jpg"
+        if fmt not in {"jpg", "png"}:
+            fmt = str(DEMO_RECORD_RGB_DEFAULT_FORMAT).lower()
+        self.record_rgb_format = fmt
+
+    def browse_record_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select LeRobot Dataset Folder", self.dataset_root)
+        if folder:
+            self.dataset_root = folder
+            self.record_folder_input.setText(folder)
+
+    def _build_record_sample(self):
+        sensors = self.ros_node.get_sensor_snapshot()
+        aligned: dict[str, Any] | None = None
+        if hasattr(self.ros_node, "get_aligned_record_components"):
+            try:
+                aligned = self.ros_node.get_aligned_record_components()
+            except Exception:
+                aligned = None
+
+        if isinstance(aligned, dict):
+            actual_qpos = list(aligned.get("actual_qpos10") or [])
+            command_qpos = list(aligned.get("command_qpos10") or [])
+            measured_pose = list(aligned.get("measured_pose_xytheta") or [0.0, 0.0, 0.0])
+            command_pose = list(aligned.get("command_pose_xytheta") or measured_pose)
+            sample_ts = float(aligned.get("timestamp", time.time()))
+            head_rgb = aligned.get("head_rgb")
+            wrist_rgb = aligned.get("wrist_rgb")
+            head_depth = aligned.get("head_depth")
+            wrist_depth = aligned.get("wrist_depth")
+            sensors["observation.sync.reference_stamp_ns"] = aligned.get("reference_stamp_ns")
+            sensors["observation.sync.aligned_joint_stamp_ns"] = aligned.get("aligned_joint_stamp_ns")
+            sensors["observation.sync.aligned_odom_stamp_ns"] = aligned.get("aligned_odom_stamp_ns")
+            sensors["observation.sync.topic_stamp_ns"] = aligned.get("stamp_ns_map", {})
+            cmd_event = aligned.get("command_event")
+            if isinstance(cmd_event, dict):
+                sensors["action_command.sent_wall_time_ns"] = cmd_event.get("wall_time_ns")
+                sensors["action_command.sent_ros_time_ns_est"] = cmd_event.get("ros_time_ns_est")
+                sensors["action_command.source"] = cmd_event.get("reason")
+            sensors["action_command.manip_base_x"] = aligned.get("command_manip_base_x")
+        else:
+            actual_qpos = self.ros_node.get_actual_qpos()
+            command_qpos = self.ros_node.get_published_qpos()
+            measured_pose = self.ros_node.get_measured_base_pose_xytheta() or [0.0, 0.0, 0.0]
+            command_pose = self.ros_node.get_command_base_pose_xytheta() or list(measured_pose)
+            sample_ts = time.time()
+            head_rgb = self.head_rgb if self.head_rgb is not None else None
+            wrist_rgb = self.wrist_rgb if self.wrist_rgb is not None else None
+            head_depth = self.depth_image if self.depth_image is not None else None
+            wrist_depth = self.wrist_depth if self.wrist_depth is not None else None
+
+        state_raw_v5 = list(actual_qpos) if actual_qpos else []
+        action_raw_v5 = list(actual_qpos) if actual_qpos else []
+        action_command_raw_v5 = list(command_qpos) if command_qpos else []
+
+        state = state_raw_v5[:8] + [float(v) for v in measured_pose]
+        action = action_raw_v5[:8] + [float(v) for v in measured_pose]
+        action_command = action_command_raw_v5[:8] + [float(v) for v in command_pose]
+
+        sensors["observation.state_raw_v5"] = state_raw_v5
+        sensors["observation.qpos_actual_raw_v5"] = action_raw_v5
+        sensors["observation.qpos_full_raw_v5"] = action_command_raw_v5
+        sensors["action_raw_v5"] = action_raw_v5
+        sensors["action_command_raw_v5"] = action_command_raw_v5
+
+        return {
+            "timestamp": sample_ts,
+            "head_rgb": head_rgb,
+            "wrist_rgb": wrist_rgb,
+            "head_depth": head_depth,
+            "wrist_depth": wrist_depth,
+            "state": state,
+            "action": action,
+            "action_command": action_command,
+            "sensors": sensors,
+        }
+
+    def _set_manual_gripper_override(self, value: float | None) -> None:
+        if value is None or not isinstance(value, (int, float)):
+            self._manual_gripper_override = None
+            return
+        try:
+            v = float(value)
+            if not math.isfinite(v):
+                self._manual_gripper_override = None
+                return
+        except (TypeError, ValueError):
+            self._manual_gripper_override = None
+            return
+        lo, hi = self.ros_node.JOINT_LIMITS[7]
+        self._manual_gripper_override = float(np.clip(v, lo, hi))
+
+    def _get_manual_gripper_target(self, fallback: float | None = None) -> float | None:
+        if self._manual_gripper_override is not None:
+            return float(self._manual_gripper_override)
+
+        target = self.ros_node.get_target_qpos()
+        if isinstance(target, list) and len(target) >= 8:
+            try:
+                v = float(target[7])
+                if math.isfinite(v):
+                    lo, hi = self.ros_node.JOINT_LIMITS[7]
+                    return float(np.clip(v, lo, hi))
+            except (TypeError, ValueError):
+                pass
+
+        actual = self.ros_node.get_actual_qpos()
+        if isinstance(actual, list) and len(actual) >= 8:
+            try:
+                v = float(actual[7])
+                if math.isfinite(v):
+                    lo, hi = self.ros_node.JOINT_LIMITS[7]
+                    return float(np.clip(v, lo, hi))
+            except (TypeError, ValueError):
+                pass
+
+        return None if fallback is None else float(fallback)
+
+    def start_demo_recording(self):
+        if self.is_recording_demo:
+            return
+        if not self.dataset_root:
+            self.status_label.setText("Set a recording folder first")
+            return
+        prompt = (self.record_prompt or "").strip()
+        if not prompt:
+            prompt = "unspecified_task"
+            self.prompt_input.setText(prompt)
+        try:
+            self.demo_recorder.start(
+                self.dataset_root,
+                prompt,
+                rgb_image_format=self.record_rgb_format,
+                rgb_jpeg_quality=self.record_rgb_jpeg_quality,
+            )
+            self.is_recording_demo = True
+            self.record_toggle_button.setText("Stop Recording")
+            self.status_label.setText(
+                f"Recording demo: {prompt} (fps={self.demo_recorder.target_fps:.1f}, rgb={self.record_rgb_format})"
+            )
+        except Exception as exc:
+            self.status_label.setText(f"Record start failed: {exc}")
+
+    def stop_demo_recording(self):
+        if not self.is_recording_demo:
+            return
+        try:
+            # Freeze recording at stop-click time (do not capture frames while popup is open).
+            self.is_recording_demo = False
+            self.record_toggle_button.setText("Record")
+            choice = QMessageBox.question(
+                self,
+                "Stop Recording",
+                "Save this episode?\n\nYes: save episode\nNo: discard episode and delete recorded files",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            discard = choice == QMessageBox.StandardButton.No
+            summary = self.demo_recorder.stop(discard=discard)
+            if discard:
+                ep = summary.get("episode_index", "?") if isinstance(summary, dict) else "?"
+                self.status_label.setText(f"Discarded demo ep {ep} (deleted recorded files)")
+            else:
+                sync_ok = self._sync_base_cmd_from_observation(update_status=False)
+                if summary is None:
+                    self.status_label.setText(
+                        f"Recording stopped (base cmd sync: {'ok' if sync_ok else 'failed'})"
+                    )
+                else:
+                    self.status_label.setText(
+                        f"Saved demo ep {summary['episode_index']} ({summary['num_frames']} frames, "
+                        f"dropped={summary.get('dropped_frames', 0)}, "
+                        f"base_sync={'ok' if sync_ok else 'failed'})"
+                    )
+                    print(f"Demo saved: {summary}")
+        except Exception as exc:
+            self.status_label.setText(f"Record stop failed: {exc}")
+
+    def toggle_demo_recording(self):
+        if self.is_recording_demo:
+            self.stop_demo_recording()
+        else:
+            self.start_demo_recording()
+
+    @staticmethod
+    def _to_pixmap(rgb: np.ndarray, target_w: int = 900, target_h: int = 520) -> QPixmap:
+        img = np.ascontiguousarray(rgb)
+        h, w = img.shape[:2]
+        qimg = QImage(img.data, w, h, img.strides[0], QImage.Format.Format_RGB888)
+        return QPixmap.fromImage(qimg).scaled(
+            target_w,
+            target_h,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+
+    def _refresh(self):
+        head, wrist, head_depth, wrist_depth = self.ros_node.get_images()
+        self.head_rgb = head
+        self.wrist_rgb = wrist
+        self.depth_image = head_depth
+        self.wrist_depth = wrist_depth
+
+        if head is not None:
+            self.head_label.setPixmap(
+                self._to_pixmap(
+                    head,
+                    target_w=max(320, self.head_label.width() - 10),
+                    target_h=max(240, self.head_label.height() - 10),
+                )
+            )
+        if wrist is not None:
+            self.wrist_label.setPixmap(
+                self._to_pixmap(
+                    wrist,
+                    target_w=max(320, self.wrist_label.width() - 10),
+                    target_h=max(240, self.wrist_label.height() - 10),
+                )
+            )
+
+        actual = self.ros_node.get_actual_qpos()
+        cmd = self.ros_node.get_published_qpos()
+        mpose = self.ros_node.get_measured_base_pose_xytheta()
+        cpose = self.ros_node.get_command_base_pose_xytheta()
+
+        cmd10 = list(cmd[:10]) + [0.0] * max(0, 10 - len(cmd))
+        actual10 = list(actual[:10]) + [0.0] * max(0, 10 - len(actual))
+        cmd_rows = cmd10[:8] + [float(cpose[0]), float(cpose[1]), float(cpose[2])]
+        measured_rows = actual10[:8] + [float(mpose[0]), float(mpose[1]), float(mpose[2])]
+        for row, (cmd_v, meas_v) in enumerate(zip(cmd_rows, measured_rows)):
+            self.state_table.item(row, 1).setText(f"{cmd_v:+.5f}")
+            self.state_table.item(row, 2).setText(f"{meas_v:+.5f}")
+
+        fps_status = "Ready" if self.ros_node.is_ready() else "Initializing"
+        hs = head.shape if head is not None else "N/A"
+        ws = wrist.shape if wrist is not None else "N/A"
+        sensors = self.ros_node.get_sensor_snapshot()
+        mode = sensors.get("observation.bridge.control_mode", "unknown")
+        self.fps_label.setText(
+            f"Robot: {fps_status} | Head: {hs} | Wrist: {ws} | "
+            f"Mode: {mode} | Delay: {self.command_smoothing_delay_s:.3f}s"
+        )
+
+        if self.is_recording_demo:
+            try:
+                self.demo_recorder.record_step(self._build_record_sample())
+            except Exception as exc:
+                print(f"Recording step error: {exc}")
+                self.stop_demo_recording()
+                self.status_label.setText(f"Recording stopped due error: {exc}")
+
+    def closeEvent(self, event):
+        if self.is_recording_demo:
+            self.stop_demo_recording()
+        self._control_timer.stop()
+        self._ui_timer.stop()
+        try:
+            self.ros_node.publish_hold_stop()
+        except Exception:
+            pass
+        self.ros_node.close()
+        event.accept()
+
+class RobotController:
+    """Robot controller that interfaces with ROS node"""
+
+    def __init__(self, ros_node):
+        self.ros_node = ros_node
+        self.running = True
+        self.step_count = 0
+        self.last_fps_time = time.time()
+
+        # Callbacks (will be set by UI)
+        self.on_images_updated = None
+        self.on_error = None
+        self.on_fps_updated = None
+
+    def step(self):
+        """Update step - called by QTimer in main thread"""
+        if not self.running:
+            return
+
+        try:
+            # Get images from ROS node
+            head_rgb, wrist_rgb, depth_image, wrist_depth = self.ros_node.get_images()
+
+            # Create dummy images if not available
+            if head_rgb is None:
+                # Create placeholder
+                if self.step_count % 30 == 0:
+                    print("Waiting for camera feed...")
+                return
+
+            # Ensure images are in correct format
+            if len(head_rgb.shape) == 2:
+                head_rgb = cv2.cvtColor(head_rgb, cv2.COLOR_GRAY2RGB)
+            elif head_rgb.shape[2] == 4:
+                head_rgb = head_rgb[:, :, :3]
+
+            if head_rgb.dtype != np.uint8:
+                head_rgb = (np.clip(head_rgb, 0, 255)).astype(np.uint8)
+
+            # Handle wrist camera
+            if wrist_rgb is None:
+                wrist_rgb = np.zeros_like(head_rgb)
+            else:
+                if len(wrist_rgb.shape) == 2:
+                    wrist_rgb = cv2.cvtColor(wrist_rgb, cv2.COLOR_GRAY2RGB)
+                elif wrist_rgb.shape[2] == 4:
+                    wrist_rgb = wrist_rgb[:, :, :3]
+                if wrist_rgb.dtype != np.uint8:
+                    wrist_rgb = (np.clip(wrist_rgb, 0, 255)).astype(np.uint8)
+
+            # Handle depth
+            if depth_image is None:
+                depth_image = np.zeros((head_rgb.shape[0], head_rgb.shape[1]), dtype=np.float32)
+            if wrist_depth is None:
+                wrist_depth = np.zeros((wrist_rgb.shape[0], wrist_rgb.shape[1]), dtype=np.float32)
+
+            # Call callback with images
+            if self.on_images_updated:
+                self.on_images_updated(
+                    head_rgb.copy(),
+                    wrist_rgb.copy(),
+                    depth_image.copy(),
+                    wrist_depth.copy(),
+                )
+
+            # FPS counter (every 30 frames)
+            self.step_count += 1
+            if self.step_count % 30 == 0:
+                current_time = time.time()
+                fps = 30 / (current_time - self.last_fps_time)
+                if self.on_fps_updated:
+                    self.on_fps_updated(fps)
+                self.last_fps_time = current_time
+
+        except Exception as e:
+            if self.on_error:
+                self.on_error(f"Robot control error: {str(e)}")
+            print(f"Error in robot control: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+
+    def set_control(self, control_name, value):
+        """Set control value - maps to ROS node"""
+        self.ros_node.set_control(control_name, value)
+
+    def adjust_control(self, control_name, delta):
+        """Adjust control value - maps to ROS node"""
+        self.ros_node.adjust_control(control_name, delta)
+
+    def stop(self):
+        """Stop the controller"""
+        self.running = False
+
+
+class SegmentationThread(QThread):
+    """Separate thread for SAM segmentation"""
+
+    # Signals
+    segmentation_complete = pyqtSignal(list, np.ndarray)  # segments, mask_overlay
+    segmentation_error = pyqtSignal(str)
+    model_loading = pyqtSignal()
+
+    def __init__(self):
+        super().__init__()
+        self.sam_model = None
+        self.rgb_image = None
+        self.depth_image = None
+        self.color_palette = self._generate_colors(50)
+
+    def _generate_colors(self, n):
+        """Generate n distinct colors"""
+        colors = []
+        for i in range(n):
+            hue = i / n
+            rgb = colorsys.hsv_to_rgb(hue, 0.8, 0.9)
+            colors.append(tuple(int(c * 255) for c in rgb))
+        return colors
+
+    def set_images(self, rgb_image, depth_image):
+        """Set images to segment"""
+        self.rgb_image = rgb_image
+        self.depth_image = depth_image
+
+    def run(self):
+        """Run segmentation"""
+        try:
+            if self.rgb_image is None:
+                self.segmentation_error.emit("No image available")
+                return
+
+            # Load SAM model if needed
+            if self.sam_model is None:
+                self.model_loading.emit()
+                import torch
+                device = 'cuda' if torch.cuda.is_available() else 'cpu'
+                print(f"Loading SAM model on {device.upper()}...", flush=True)
+                self.sam_model = SAM("/home/ibk5106/Desktop/Projects/teleop_in_behavior/sam_b.pt")
+                self.sam_model.to(device)
+                print(f"SAM model loaded on {device.upper()}!", flush=True)
+
+            # Run segmentation
+            print("Running SAM inference on GPU...", flush=True)
+            import time
+            start_time = time.time()
+            results = self.sam_model(self.rgb_image, verbose=False)
+            inference_time = time.time() - start_time
+            print(f"SAM inference completed in {inference_time:.1f} seconds", flush=True)
+
+            # Extract segments
+            segments = []
+            masks_combined = np.zeros_like(self.rgb_image)
+            seg_id = 0
+            filtered_small = 0
+
+            if len(results) > 0 and results[0].masks is not None:
+                masks = results[0].masks.data.cpu().numpy()
+
+                for mask in masks:
+                    mask_binary = (mask > 0.5).astype(np.uint8)
+                    if mask_binary.sum() == 0:
+                        continue
+
+                    # Split disconnected parts of one SAM mask into separate instances.
+                    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+                        mask_binary, connectivity=8
+                    )
+                    for comp_id in range(1, num_labels):  # 0 = background
+                        x = int(stats[comp_id, cv2.CC_STAT_LEFT])
+                        y = int(stats[comp_id, cv2.CC_STAT_TOP])
+                        w = int(stats[comp_id, cv2.CC_STAT_WIDTH])
+                        h = int(stats[comp_id, cv2.CC_STAT_HEIGHT])
+                        area_px = int(stats[comp_id, cv2.CC_STAT_AREA])
+
+                        # Filter tiny fragmented components.
+                        if (area_px < SAM_CC_MIN_AREA_PX or
+                                w < SAM_CC_MIN_WIDTH_PX or
+                                h < SAM_CC_MIN_HEIGHT_PX):
+                            filtered_small += 1
+                            continue
+
+                        comp_mask = (labels == comp_id).astype(np.uint8)
+                        center_x = int(round(float(centroids[comp_id, 0])))
+                        center_y = int(round(float(centroids[comp_id, 1])))
+
+                        # Get depth at component (median of valid depths, fallback to center pixel)
+                        depth_value = 0.0
+                        if self.depth_image is not None:
+                            comp_depth = self.depth_image[comp_mask > 0]
+                            valid_depth = comp_depth[(comp_depth > 0.1) & (comp_depth < 5.0)]
+                            if len(valid_depth) > 0:
+                                depth_value = float(np.median(valid_depth))
+                            elif (0 <= center_y < self.depth_image.shape[0] and
+                                  0 <= center_x < self.depth_image.shape[1]):
+                                depth_value = float(self.depth_image[center_y, center_x])
+
+                        segment_info = {
+                            'id': seg_id,
+                            'mask': comp_mask,
+                            'bbox': (x, y, w, h),
+                            'center': (center_x, center_y),
+                            'depth': depth_value,
+                            'area': area_px,
+                            'color': self.color_palette[seg_id % len(self.color_palette)]
+                        }
+                        segments.append(segment_info)
+                        seg_id += 1
+
+                        # Add to combined mask
+                        color = segment_info['color']
+                        masks_combined[comp_mask > 0] = color
+
+            if filtered_small > 0:
+                print(f"SAM post-process: filtered {filtered_small} tiny components "
+                      f"(area<{SAM_CC_MIN_AREA_PX} or w<{SAM_CC_MIN_WIDTH_PX} or h<{SAM_CC_MIN_HEIGHT_PX})",
+                      flush=True)
+
+            self.segmentation_complete.emit(segments, masks_combined)
+
+        except Exception as e:
+            self.segmentation_error.emit(f"Segmentation error: {str(e)}")
+            print(f"Segmentation error: {e}")
+            import traceback
+            traceback.print_exc()
+
+
+class RobotTeleopUI(QMainWindow):
+    """Main UI class for robot teleoperation with SAM segmentation"""
+    ui_status_signal = pyqtSignal(str, str)
+    ui_return_enabled_signal = pyqtSignal(bool)
+    ui_action_state_signal = pyqtSignal(str)
+    JOINT_TABLE_NAMES = [
+        "arm_extension",
+        "arm_lift",
+        "wrist_yaw",
+        "wrist_pitch",
+        "wrist_roll",
+        "head_pan",
+        "head_tilt",
+        "gripper",
+        "base_x",
+        "base_y",
+        "base_theta",
+    ]
+
+    def __init__(self, ros_node):
+        super().__init__()
+
+        self.ros_node = ros_node
+        self.image_source = "bridge"
+        if hasattr(self.ros_node, "get_image_source"):
+            try:
+                self.image_source = str(self.ros_node.get_image_source())
+            except Exception:
+                self.image_source = "bridge"
+
+        # State
+        self.head_rgb = None
+        self.wrist_rgb = None
+        self.depth_image = None
+        self.wrist_depth = None
+        self.mask_overlay = None
+        self._grasp_debug_info = None  # rect_info with axis_pixels for debug overlay
+        self.segments = []
+        self.selected_segment = None
+        self.use_head_for_segmentation = True  # Use head camera for segmentation by default
+        self._pre_action_state = None  # saved before reach/grasp so we can return
+        self._action_lock = threading.Lock()
+        self._action_state = 'idle'  # idle|running|paused|awaiting_confirm|awaiting_post_grasp
+        self._action_mode = None
+        self._action_abort_requested = False
+        self._manual_gripper_override: float | None = None
+        # Queued two-goal workflow (grasp -> reach) planned from the same frame.
+        self.queued_goals = {"grasp": None, "reach": None}
+        self.queued_goal_cursor = 0
+        self.queued_sequence_started = False
+        self._deferred_next_goal_start = False
+        self._skip_to_next_goal_requested = False
+        # v8 manual region-based grasp annotation state.
+        self.manual_grasp_regions: list[dict[str, Any]] = []
+        self._manual_region_next_id = 1
+        self._manual_selected_region_id: int | None = None
+        self._manual_draw_mode: str | None = None  # None | "draw_rect" | "pick_points"
+        self._manual_dragging_rect = False
+        self._manual_rect_start_px: tuple[int, int] | None = None
+        self._manual_rect_live_px: tuple[int, int] | None = None
+        self.dataset_root = str((Path.cwd() / "demo_record/stretch_recordings_v9_simple").resolve())
+        self.record_prompt = ""
+        self.record_rgb_format = str(DEMO_RECORD_RGB_DEFAULT_FORMAT).lower()
+        self.record_rgb_jpeg_quality = int(DEMO_RECORD_RGB_JPEG_QUALITY)
+        self.is_recording_demo = False
+        self.demo_recorder = LeRobotStyleRecorder(robot_type="stretch3", target_fps=DEMO_RECORD_FPS)
+
+        # Control parameters (increased for better responsiveness)
+        self.linear_speed = 0.03       # m per base command step
+        # Rotation step used by base rotate buttons (kept in rad for command path).
+        self.angular_speed = float(np.deg2rad(DEFAULT_BASE_ROTATE_STEP_DEG))
+        self.arm_speed = 0.005         # m or rad increment per update
+        self.head_speed = 0.02         # rad increment per update
+        self.wrist_speed = 0.02        # rad increment per update
+        self.gripper_step = 0.02       # joint increment per click (open/close)
+        self.command_smoothing_delay = DEFAULT_COMMAND_SMOOTH_DELAY_S
+        self.base_angle_step_deg = float(DEFAULT_BASE_ROTATE_STEP_DEG)
+
+        # Grasp planner (will be adapted for ROS)
+        # For now, we'll implement basic grasping behavior
+        self.grasp_planner_available = True  # Always show grasp button
+        print("Note: Grasp planner will use basic approach behavior")
+
+        # Setup robot controller
+        self.robot_controller = RobotController(ros_node)
+        self.robot_controller.on_images_updated = self.on_images_updated
+        self.robot_controller.on_error = self.on_error
+        self.robot_controller.on_fps_updated = self.on_fps_updated
+        self.device_bridge = EncoderDeviceHttpBridge()
+        self._device_prev_yaw_rad: float | None = None
+        self._device_prev_enc: tuple[float, float, float] | None = None
+        self._device_prec_level: int | None = None
+        self.device_yaw_reverse = True
+        self._device_debug_print_count = 0
+        self._device_b1_active = False
+        self._device_b1_yaw_ref: float | None = None
+        self._device_b1_wrist_ref: float | None = None
+        self._device_b1_prev_pressed = False
+        self._device_b1_open_next = True
+        self._device_input_ok = self.device_bridge.start()
+        if not self._device_input_ok:
+            print(
+                f"[device] BLE input disabled: {self.device_bridge.last_error}",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"[device] BLE input enabled for '{DEVICE_BLE_NAME}' "
+                f"(char={DEVICE_BLE_CHARACTERISTIC_UUID})"
+            )
+        self.ros_node.set_command_smoothing_delay(self.command_smoothing_delay)
+        if hasattr(self.ros_node, 'set_base_rotate_step_deg'):
+            self.ros_node.set_base_rotate_step_deg(self.base_angle_step_deg)
+        if hasattr(self.ros_node, 'set_base_rotate_step_delay'):
+            self.ros_node.set_base_rotate_step_delay(self.command_smoothing_delay)
+
+        # Setup segmentation thread
+        self.seg_thread = SegmentationThread()
+        self.seg_thread.segmentation_complete.connect(self.on_segmentation_complete)
+        self.seg_thread.segmentation_error.connect(self.on_error)
+        self.seg_thread.model_loading.connect(self.on_model_loading)
+
+        # Setup UI
+        self.init_ui()
+        # Thread-safe UI update signals (worker threads -> main Qt thread)
+        self.ui_status_signal.connect(self._apply_status_update)
+        self.ui_return_enabled_signal.connect(self.return_button.setEnabled)
+        self.ui_action_state_signal.connect(self._apply_action_state_ui)
+        self._update_goal_queue_label()
+        self._update_next_goal_button_state()
+
+        # Setup timer for update loop (runs in main thread)
+        self.control_timer = QTimer()
+        self.control_timer.timeout.connect(self.robot_controller.step)
+        self.control_timer.start(100)  # ~10 FPS (gives GIL time to camera thread)
+
+        self.device_timer = QTimer()
+        self.device_timer.timeout.connect(self._poll_device_control)
+        self.device_timer.start(max(10, int(round(1000.0 / max(1e-3, float(DEVICE_POLL_HZ))))))
+
+        print("UI initialized successfully", flush=True)
+
+    def init_ui(self):
+        """Initialize the user interface"""
+        self.setWindowTitle("Robot Teleoperation with SAM + Device (ROS2)")
+        self.setGeometry(100, 100, 1400, 900)
+        self.setMinimumSize(1000, 700)  # Set minimum window size
+
+        # Central widget
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        main_layout = QVBoxLayout(central_widget)
+        main_layout.setContentsMargins(5, 5, 5, 5)  # Reduce margins
+        main_layout.setSpacing(5)
+
+        # Content layout (horizontal)
+        content_layout = QHBoxLayout()
+        content_layout.setSpacing(5)
+
+        # Left side: Camera feeds (takes more space)
+        camera_widget = self.create_camera_widget()
+        content_layout.addWidget(camera_widget, stretch=3)
+
+        # Right side: Controls and objects (fixed width range)
+        control_widget = self.create_control_widget()
+        content_layout.addWidget(control_widget, stretch=2)
+
+        main_layout.addLayout(content_layout, stretch=1)
+
+        # Status bar at bottom (fixed height)
+        self.fps_label = QLabel("FPS: --")
+        self.fps_label.setStyleSheet("QLabel { padding: 5px; background-color: #2c3e50; color: white; font-size: 11px; }")
+        self.fps_label.setMaximumHeight(30)
+        main_layout.addWidget(self.fps_label)
+
+    def create_camera_widget(self):
+        """Create camera feed widget"""
+        widget = QGroupBox("Camera Feeds (ROS2 Topics, Timestamp-Aligned)")
+        layout = QVBoxLayout()
+        source_row = QHBoxLayout()
+        source_row.addWidget(QLabel("Observation Source"))
+        self.image_source_status = QLabel("ROS2 Topics (fixed)")
+        self.image_source_status.setStyleSheet("QLabel { color: #1e88e5; font-size: 10px; }")
+        source_row.addWidget(self.image_source_status)
+        layout.addLayout(source_row)
+
+        # Head RGB Camera
+        head_label = QLabel("Head RGB Camera (/camera/color/image_raw)")
+        head_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(head_label)
+
+        # Wrapper container expands to fill space; label inside shrinks to image
+        self.head_container = QWidget()
+        self.head_container.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        head_container_layout = QHBoxLayout(self.head_container)
+        head_container_layout.setContentsMargins(0, 0, 0, 0)
+        head_container_layout.addStretch()
+        self.head_display = QLabel("Waiting for head camera feed...")
+        self.head_display.setScaledContents(True)
+        self.head_display.setStyleSheet("QLabel { background-color: black; color: white; }")
+        self.head_display.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.head_display.mousePressEvent = self._on_head_mouse_press
+        self.head_display.mouseMoveEvent = self._on_head_mouse_move
+        self.head_display.mouseReleaseEvent = self._on_head_mouse_release
+        head_container_layout.addWidget(self.head_display)
+        head_container_layout.addStretch()
+        layout.addWidget(self.head_container, stretch=6)
+
+        # Wrist/Gripper RGB Camera
+        self.wrist_label = QLabel("Gripper RGB Camera (no feed)")
+        self.wrist_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.wrist_label)
+
+        self.wrist_container = QWidget()
+        self.wrist_container.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        self.wrist_container.setMaximumHeight(40)  # Small placeholder when no image
+        wrist_container_layout = QHBoxLayout(self.wrist_container)
+        wrist_container_layout.setContentsMargins(0, 0, 0, 0)
+        wrist_container_layout.addStretch()
+        self.wrist_display = QLabel("No wrist camera feed")
+        self.wrist_display.setScaledContents(True)
+        self.wrist_display.setStyleSheet("QLabel { background-color: #1a1a1a; color: gray; }")
+        self.wrist_display.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        wrist_container_layout.addWidget(self.wrist_display)
+        wrist_container_layout.addStretch()
+        self._wrist_feed_active = False  # Track whether we've received an image
+        layout.addWidget(self.wrist_container, stretch=0)
+
+        # Segmentation button
+        self.segment_button = QPushButton("Run SAM Segmentation (Head Camera)")
+        self.segment_button.clicked.connect(self.run_segmentation)
+        self.segment_button.setMinimumHeight(40)
+        self.segment_button.setMaximumHeight(60)  # Prevent button from getting too tall
+        layout.addWidget(self.segment_button)
+
+        widget.setLayout(layout)
+        return widget
+
+    def on_image_source_changed(self, _index: int):
+        source = "ros_topic"
+        try:
+            result = None
+            if hasattr(self.ros_node, "set_image_source"):
+                result = self.ros_node.set_image_source(source)
+            self.image_source = "ros_topic"
+            if hasattr(self, "image_source_status"):
+                self.image_source_status.setText("ROS2 Topics (fixed)")
+                if isinstance(result, dict) and not result.get("ok", False):
+                    self.image_source_status.setStyleSheet("QLabel { color: #ef6c00; font-size: 10px; }")
+                else:
+                    self.image_source_status.setStyleSheet("QLabel { color: #1e88e5; font-size: 10px; }")
+            if hasattr(self, "status_label"):
+                if isinstance(result, dict) and not result.get("ok", False):
+                    self.status_label.setText(
+                        f"Observation source fixed to ros_topic, waiting for data: "
+                        f"{result.get('error', 'connect pending')}"
+                    )
+                    self.status_label.setStyleSheet("QLabel { color: #ef6c00; font-size: 10px; }")
+                else:
+                    self.status_label.setText("Observation source fixed to ros_topic")
+                    self.status_label.setStyleSheet("QLabel { color: blue; font-size: 10px; }")
+        except Exception as exc:
+            if hasattr(self, "image_source_status"):
+                self.image_source_status.setText(f"Using: {self.image_source}")
+                self.image_source_status.setStyleSheet("QLabel { color: #d32f2f; font-size: 10px; }")
+            if hasattr(self, "status_label"):
+                self.status_label.setText(f"Observation source switch failed: {exc}")
+                self.status_label.setStyleSheet("QLabel { color: red; font-size: 10px; }")
+            print(f"[observation_source] switch error: {exc}", file=sys.stderr)
+
+    def create_control_widget(self):
+        """Create two-column right side: controls (middle) + detected objects/actions (right)."""
+        widget = QWidget()
+        widget.setMinimumWidth(620)
+        widget.setMaximumWidth(980)
+        layout = QHBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        # Middle column: robot controls
+        left_scroll = QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        left_container = QWidget()
+        left_layout = QVBoxLayout(left_container)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(6)
+        left_layout.addWidget(self.create_robot_controls())
+        left_layout.addStretch(1)
+        left_scroll.setWidget(left_container)
+
+        # Right-most column: detected objects + action flow + recording widgets
+        right_scroll = QScrollArea()
+        right_scroll.setWidgetResizable(True)
+        right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        right_container = QWidget()
+        right_layout = QVBoxLayout(right_container)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(6)
+        right_layout.addWidget(self.create_object_list())
+        right_layout.addStretch(1)
+        right_scroll.setWidget(right_container)
+
+        layout.addWidget(left_scroll, stretch=1)
+        layout.addWidget(right_scroll, stretch=1)
+        widget.setLayout(layout)
+        return widget
+
+    def _create_speed_slider(
+        self,
+        min_val,
+        max_val,
+        default_val,
+        callback,
+        reverse: bool = False,
+        value_fmt: str = "{:.3f}",
+        label_text: str = "Step Size",
+    ):
+        """Create a compact speed slider row: [Slow] --slider-- [Fast] value_label."""
+        row = QHBoxLayout()
+        row.setSpacing(4)
+
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setRange(0, 100)
+        lo = float(min_val)
+        hi = float(max_val)
+        if hi < lo:
+            lo, hi = hi, lo
+
+        value = float(default_val) if np.isfinite(default_val) else lo
+        value = float(np.clip(value, lo, hi))
+        pos_norm = (value - lo) / (hi - lo) if hi > lo else 0.0
+        if reverse:
+            pos_norm = 1.0 - pos_norm
+        slider.setValue(int(round(max(0.0, min(1.0, pos_norm)) * 100.0)))
+        slider.setFixedHeight(20)
+
+        val_label = QLabel(value_fmt.format(float(default_val)))
+        val_label.setFixedWidth(45)
+        val_label.setStyleSheet("QLabel { font-size: 10px; }")
+
+        def on_change(v):
+            p = float(int(v)) / 100.0
+            if reverse:
+                p = 1.0 - p
+            speed = lo + (hi - lo) * p
+            val_label.setText(value_fmt.format(float(speed)))
+            callback(speed)
+
+        slider.valueChanged.connect(on_change)
+
+        row.addWidget(QLabel(label_text))
+        row.addWidget(slider)
+        row.addWidget(val_label)
+        return row
+
+    def _create_delay_slider(self, min_val, max_val, default_val, callback):
+        """Create compact slider row for smoothing loop delay."""
+        return self._create_speed_slider(
+            min_val,
+            max_val,
+            default_val,
+            callback,
+            reverse=True,
+            value_fmt="{:.3f}s",
+            label_text="Speed",
+        )
+
+    def create_robot_controls(self):
+        """Create robot control buttons"""
+        widget = QGroupBox("Robot Controls (Bridge Commands)")
+        layout = QVBoxLayout()
+
+        # Base controls
+        base_group = QGroupBox("Base Movement")
+        base_layout = QGridLayout()
+        base_layout.setSpacing(3)
+
+        btn_forward = QPushButton("↑")
+        btn_forward.setToolTip("Move Forward")
+        btn_forward.setMinimumHeight(40)
+        btn_forward.pressed.connect(lambda: self.start_control('base_linear', self.linear_speed))
+        btn_forward.released.connect(lambda: self.stop_control('base_linear'))
+        base_layout.addWidget(btn_forward, 0, 1)
+
+        btn_left = QPushButton("←")
+        btn_left.setToolTip("Rotate Left")
+        btn_left.setMinimumHeight(40)
+        btn_left.pressed.connect(
+            lambda: self.start_control('base_angular', float(np.deg2rad(self.base_angle_step_deg)))
+        )
+        btn_left.released.connect(lambda: self.stop_control('base_angular'))
+        base_layout.addWidget(btn_left, 1, 0)
+
+        btn_backward = QPushButton("↓")
+        btn_backward.setToolTip("Move Backward")
+        btn_backward.setMinimumHeight(40)
+        btn_backward.pressed.connect(lambda: self.start_control('base_linear', -self.linear_speed))
+        btn_backward.released.connect(lambda: self.stop_control('base_linear'))
+        base_layout.addWidget(btn_backward, 1, 1)
+
+        btn_right = QPushButton("→")
+        btn_right.setToolTip("Rotate Right")
+        btn_right.setMinimumHeight(40)
+        btn_right.pressed.connect(
+            lambda: self.start_control('base_angular', -float(np.deg2rad(self.base_angle_step_deg)))
+        )
+        btn_right.released.connect(lambda: self.stop_control('base_angular'))
+        base_layout.addWidget(btn_right, 1, 2)
+
+        base_layout.addWidget(QLabel("Linear Step"), 2, 0)
+        base_layout.addWidget(QLabel("Rotation Step"), 3, 0)
+
+        def set_base_linear_step(v):
+            self.linear_speed = v
+
+        def set_base_angle_step_deg(v):
+            self.base_angle_step_deg = float(v)
+            # Keep cached rad-step aligned with UI slider.
+            self.angular_speed = float(np.deg2rad(self.base_angle_step_deg))
+            if hasattr(self.ros_node, 'set_base_rotate_step_deg'):
+                self.ros_node.set_base_rotate_step_deg(self.base_angle_step_deg)
+
+        base_layout.addLayout(
+            self._create_speed_slider(
+                DEVICE_BASE_STEP_MIN_M,
+                DEVICE_BASE_STEP_MAX_M,
+                self.linear_speed,
+                set_base_linear_step,
+            ),
+            2,
+            1,
+            1,
+            2,
+        )
+        base_layout.addLayout(
+            self._create_speed_slider(5.8, 20.0, self.base_angle_step_deg, set_base_angle_step_deg), 3, 1, 1, 2)
+
+        base_layout.addWidget(QLabel("Move (cm)"), 4, 0)
+        self.base_distance_cm_input = QLineEdit("0")
+        self.base_distance_cm_input.setPlaceholderText("+100 / -100")
+        move_dist_btn = QPushButton("Move Distance")
+
+        def _move_base_distance():
+            txt = self.base_distance_cm_input.text().strip()
+            if not txt:
+                return
+            try:
+                dx_m = float(txt) / 100.0
+            except ValueError:
+                if hasattr(self, "status_label"):
+                    self.status_label.setText("Base move requires numeric cm value")
+                return
+            if abs(dx_m) < 1e-6:
+                return
+            try:
+                if hasattr(self.ros_node, "stop_base"):
+                    self.ros_node.stop_base()
+                ok = self.ros_node.move_base_relative(
+                    dx=dx_m,
+                    dy=0.0,
+                    dtheta=0.0,
+                    blocking=False,
+                    timeout_s=max(2.0, 4.0 + abs(dx_m) * 6.0),
+                )
+                if hasattr(self, "status_label"):
+                    self.status_label.setText(
+                        f"Base move command {dx_m:+.3f} m ({'sent' if ok else 'failed'})"
+                    )
+            except Exception as exc:
+                if hasattr(self, "status_label"):
+                    self.status_label.setText(f"Base move failed: {exc}")
+
+        move_dist_btn.clicked.connect(_move_base_distance)
+        base_layout.addWidget(self.base_distance_cm_input, 4, 1)
+        base_layout.addWidget(move_dist_btn, 4, 2)
+
+        base_group.setLayout(base_layout)
+        layout.addWidget(base_group)
+
+        # Command smoothing controls (applies to all published qpos channels).
+        smooth_group = QGroupBox("Command Smoothing")
+        smooth_layout = QVBoxLayout()
+        smooth_layout.setSpacing(3)
+
+        def set_command_smoothing_delay(v):
+            self.command_smoothing_delay = v
+            self.ros_node.set_command_smoothing_delay(v)
+            if hasattr(self.ros_node, 'set_base_rotate_step_delay'):
+                self.ros_node.set_base_rotate_step_delay(v)
+
+        smooth_layout.addLayout(
+            self._create_delay_slider(0.20, 0.01, self.command_smoothing_delay, set_command_smoothing_delay)
+        )
+        smooth_hint = QLabel("Large target jumps are split into small per-channel steps before publish.")
+        smooth_hint.setWordWrap(True)
+        smooth_hint.setStyleSheet("QLabel { color: gray; font-size: 10px; }")
+        smooth_layout.addWidget(smooth_hint)
+        smooth_group.setLayout(smooth_layout)
+        layout.addWidget(smooth_group)
+
+        # Arm controls
+        arm_group = QGroupBox("Arm")
+        arm_layout = QGridLayout()
+        arm_layout.setSpacing(3)
+
+        btn_lift_up = QPushButton("Lift ↑")
+        btn_lift_up.setMinimumHeight(35)
+        btn_lift_up.pressed.connect(lambda: self.start_control_incremental('arm_lift', self.arm_speed))
+        btn_lift_up.released.connect(lambda: self.stop_control('arm_lift'))
+        arm_layout.addWidget(btn_lift_up, 0, 0)
+
+        btn_lift_down = QPushButton("Lift ↓")
+        btn_lift_down.setMinimumHeight(35)
+        btn_lift_down.pressed.connect(lambda: self.start_control_incremental('arm_lift', -self.arm_speed))
+        btn_lift_down.released.connect(lambda: self.stop_control('arm_lift'))
+        arm_layout.addWidget(btn_lift_down, 0, 1)
+
+        btn_extend = QPushButton("Extend →")
+        btn_extend.setMinimumHeight(35)
+        btn_extend.pressed.connect(lambda: self.start_control_incremental('arm_extension', self.arm_speed))
+        btn_extend.released.connect(lambda: self.stop_control('arm_extension'))
+        arm_layout.addWidget(btn_extend, 1, 0)
+
+        btn_retract = QPushButton("Retract ←")
+        btn_retract.setMinimumHeight(35)
+        btn_retract.pressed.connect(lambda: self.start_control_incremental('arm_extension', -self.arm_speed))
+        btn_retract.released.connect(lambda: self.stop_control('arm_extension'))
+        arm_layout.addWidget(btn_retract, 1, 1)
+
+        arm_layout.addLayout(
+            self._create_speed_slider(
+                DEVICE_ARM_STEP_MIN,
+                DEVICE_ARM_STEP_MAX,
+                self.arm_speed,
+                lambda v: setattr(self, 'arm_speed', v),
+            ),
+            2,
+            0,
+            1,
+            2,
+        )
+
+        arm_group.setLayout(arm_layout)
+        layout.addWidget(arm_group)
+
+        # Head controls
+        head_group = QGroupBox("Head")
+        head_layout = QGridLayout()
+        head_layout.setSpacing(3)
+
+        btn_pan_left = QPushButton("Pan ←")
+        btn_pan_left.setMinimumHeight(35)
+        btn_pan_left.pressed.connect(lambda: self.start_control_incremental('head_pan', self.head_speed))
+        btn_pan_left.released.connect(lambda: self.stop_control('head_pan'))
+        head_layout.addWidget(btn_pan_left, 0, 0)
+
+        btn_pan_right = QPushButton("Pan →")
+        btn_pan_right.setMinimumHeight(35)
+        btn_pan_right.pressed.connect(lambda: self.start_control_incremental('head_pan', -self.head_speed))
+        btn_pan_right.released.connect(lambda: self.stop_control('head_pan'))
+        head_layout.addWidget(btn_pan_right, 0, 1)
+
+        btn_tilt_up = QPushButton("Tilt ↑")
+        btn_tilt_up.setMinimumHeight(35)
+        btn_tilt_up.pressed.connect(lambda: self.start_control_incremental('head_tilt', self.head_speed))
+        btn_tilt_up.released.connect(lambda: self.stop_control('head_tilt'))
+        head_layout.addWidget(btn_tilt_up, 1, 0)
+
+        btn_tilt_down = QPushButton("Tilt ↓")
+        btn_tilt_down.setMinimumHeight(35)
+        btn_tilt_down.pressed.connect(lambda: self.start_control_incremental('head_tilt', -self.head_speed))
+        btn_tilt_down.released.connect(lambda: self.stop_control('head_tilt'))
+        head_layout.addWidget(btn_tilt_down, 1, 1)
+
+        head_layout.addLayout(
+            self._create_speed_slider(0.02, 0.30, self.head_speed, lambda v: setattr(self, 'head_speed', v)), 2, 0, 1, 2)
+
+        head_group.setLayout(head_layout)
+        layout.addWidget(head_group)
+
+        # Wrist controls
+        wrist_group = QGroupBox("Wrist")
+        wrist_layout = QGridLayout()
+        wrist_layout.setSpacing(3)
+
+        btn_roll_left = QPushButton("Roll ↶")
+        btn_roll_left.setMinimumHeight(30)
+        btn_roll_left.pressed.connect(lambda: self.start_control_incremental('wrist_roll', -self.wrist_speed))
+        btn_roll_left.released.connect(lambda: self.stop_control('wrist_roll'))
+        wrist_layout.addWidget(btn_roll_left, 0, 0)
+
+        btn_roll_right = QPushButton("Roll ↷")
+        btn_roll_right.setMinimumHeight(30)
+        btn_roll_right.pressed.connect(lambda: self.start_control_incremental('wrist_roll', self.wrist_speed))
+        btn_roll_right.released.connect(lambda: self.stop_control('wrist_roll'))
+        wrist_layout.addWidget(btn_roll_right, 0, 1)
+
+        btn_pitch_down = QPushButton("Pitch ↓")
+        btn_pitch_down.setMinimumHeight(30)
+        btn_pitch_down.pressed.connect(lambda: self.start_control_incremental('wrist_pitch', -self.wrist_speed))
+        btn_pitch_down.released.connect(lambda: self.stop_control('wrist_pitch'))
+        wrist_layout.addWidget(btn_pitch_down, 1, 0)
+
+        btn_pitch_up = QPushButton("Pitch ↑")
+        btn_pitch_up.setMinimumHeight(30)
+        btn_pitch_up.pressed.connect(lambda: self.start_control_incremental('wrist_pitch', self.wrist_speed))
+        btn_pitch_up.released.connect(lambda: self.stop_control('wrist_pitch'))
+        wrist_layout.addWidget(btn_pitch_up, 1, 1)
+
+        btn_yaw_left = QPushButton("Yaw ←")
+        btn_yaw_left.setMinimumHeight(30)
+        btn_yaw_left.pressed.connect(lambda: self.start_control_incremental('wrist_yaw', self.wrist_speed))
+        btn_yaw_left.released.connect(lambda: self.stop_control('wrist_yaw'))
+        wrist_layout.addWidget(btn_yaw_left, 2, 0)
+
+        btn_yaw_right = QPushButton("Yaw →")
+        btn_yaw_right.setMinimumHeight(30)
+        btn_yaw_right.pressed.connect(lambda: self.start_control_incremental('wrist_yaw', -self.wrist_speed))
+        btn_yaw_right.released.connect(lambda: self.stop_control('wrist_yaw'))
+        wrist_layout.addWidget(btn_yaw_right, 2, 1)
+
+        wrist_layout.addLayout(
+            self._create_speed_slider(0.02, 0.30, self.wrist_speed, lambda v: setattr(self, 'wrist_speed', v)), 3, 0, 1, 2)
+
+        wrist_group.setLayout(wrist_layout)
+        layout.addWidget(wrist_group)
+
+        # Gripper controls
+        gripper_group = QGroupBox("Gripper")
+        gripper_layout = QGridLayout()
+        gripper_layout.setSpacing(3)
+
+        btn_gripper_open = QPushButton("Open +")
+        btn_gripper_open.setMinimumHeight(35)
+        btn_gripper_open.setToolTip("Open gripper by one step")
+        btn_gripper_open.clicked.connect(lambda: self.adjust_gripper_step(+1))
+        gripper_layout.addWidget(btn_gripper_open, 0, 0)
+
+        btn_gripper_close = QPushButton("Close -")
+        btn_gripper_close.setMinimumHeight(35)
+        btn_gripper_close.setToolTip("Close gripper by one step")
+        btn_gripper_close.clicked.connect(lambda: self.adjust_gripper_step(-1))
+        gripper_layout.addWidget(btn_gripper_close, 0, 1)
+
+        btn_gripper_open_full = QPushButton("Open Full")
+        btn_gripper_open_full.setMinimumHeight(35)
+        btn_gripper_open_full.setToolTip("Open gripper to maximum limit")
+        btn_gripper_open_full.clicked.connect(lambda: self.set_gripper(self.ros_node.JOINT_LIMITS[7][1]))
+        gripper_layout.addWidget(btn_gripper_open_full, 1, 0)
+
+        btn_gripper_close_full = QPushButton("Close Full")
+        btn_gripper_close_full.setMinimumHeight(35)
+        btn_gripper_close_full.setToolTip("Close gripper to minimum limit")
+        btn_gripper_close_full.clicked.connect(lambda: self.set_gripper(self.ros_node.JOINT_LIMITS[7][0]))
+        gripper_layout.addWidget(btn_gripper_close_full, 1, 1)
+
+        gripper_layout.addLayout(
+            self._create_speed_slider(
+                DEVICE_GRIPPER_STEP_MIN,
+                DEVICE_GRIPPER_STEP_MAX,
+                self.gripper_step,
+                lambda v: setattr(self, 'gripper_step', v)
+            ),
+            2, 0, 1, 2
+        )
+
+        gripper_group.setLayout(gripper_layout)
+        layout.addWidget(gripper_group)
+
+        # Device precision indicator (from incoming device packet raw[4], range 0..4).
+        self.device_prec_label = QLabel("Device Prec: --")
+        self.device_prec_label.setStyleSheet("QLabel { color: #555; font-size: 10px; }")
+        layout.addWidget(self.device_prec_label)
+
+        # Yaw sign mode toggle for device-driven wrist yaw.
+        self.device_yaw_mode_button = QPushButton()
+        self.device_yaw_mode_button.setMinimumHeight(30)
+        self.device_yaw_mode_button.clicked.connect(self._toggle_device_yaw_mode)
+        self._update_device_yaw_mode_button()
+        layout.addWidget(self.device_yaw_mode_button)
+
+        # Keep table in control column; size it so all rows are visible without table scrolling.
+        layout.addWidget(self.create_joint_state_panel())
+
+        widget.setLayout(layout)
+        return widget
+
+    def create_joint_state_panel(self):
+        """Create realtime joint command/state panel."""
+        state_group = QGroupBox("Joint State (Realtime)")
+        state_layout = QVBoxLayout()
+        sync_row = QHBoxLayout()
+        self.sync_base_cmd_button = QPushButton("Sync Cmd Base x/y/theta")
+        self.sync_base_cmd_button.setToolTip("Set command base x,y,theta from observed robot base pose")
+        self.sync_base_cmd_button.clicked.connect(self._on_sync_base_cmd_clicked)
+        sync_row.addWidget(self.sync_base_cmd_button)
+        self.sync_joints_cmd_button = QPushButton("Sync Cmd 8 Joints")
+        self.sync_joints_cmd_button.setToolTip("Set command 8 joints from observed robot joints")
+        self.sync_joints_cmd_button.clicked.connect(self._on_sync_joints_cmd_clicked)
+        sync_row.addWidget(self.sync_joints_cmd_button)
+        self.home_pose_button = QPushButton("Home Pose")
+        self.home_pose_button.setToolTip("Send robot to startup/default joint pose")
+        self.home_pose_button.clicked.connect(self._on_home_pose_clicked)
+        sync_row.addWidget(self.home_pose_button)
+        state_layout.addLayout(sync_row)
+
+        self.joint_state_table = QTableWidget(len(self.JOINT_TABLE_NAMES), 3)
+        self.joint_state_table.setHorizontalHeaderLabels(["Joint Name", "Cmd Action", "Observation State"])
+        self.joint_state_table.verticalHeader().setVisible(False)
+        self.joint_state_table.setAlternatingRowColors(True)
+        self.joint_state_table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        self.joint_state_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.joint_state_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.joint_state_table.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.joint_state_table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.joint_state_table.setMinimumWidth(380)
+        self.joint_state_table.setColumnWidth(0, 145)
+        self.joint_state_table.setColumnWidth(1, 125)
+        self.joint_state_table.setColumnWidth(2, 145)
+        self.joint_state_table.horizontalHeader().setStretchLastSection(True)
+        for row, name in enumerate(self.JOINT_TABLE_NAMES):
+            self.joint_state_table.setItem(row, 0, QTableWidgetItem(name))
+            self.joint_state_table.setItem(row, 1, QTableWidgetItem("--"))
+            self.joint_state_table.setItem(row, 2, QTableWidgetItem("--"))
+        row_h = self.joint_state_table.verticalHeader().defaultSectionSize()
+        hdr_h = self.joint_state_table.horizontalHeader().height()
+        frame = self.joint_state_table.frameWidth()
+        table_h = int(hdr_h + (row_h * len(self.JOINT_TABLE_NAMES)) + (2 * frame) + 2)
+        self.joint_state_table.setFixedHeight(table_h)
+        state_layout.addWidget(self.joint_state_table)
+        state_group.setLayout(state_layout)
+        return state_group
+
+    def _sync_base_cmd_from_observation(self, *, update_status: bool = True) -> bool:
+        ok = False
+        try:
+            if hasattr(self.ros_node, "sync_base_command_pose_to_observation"):
+                ok = bool(self.ros_node.sync_base_command_pose_to_observation())
+        except Exception as exc:
+            ok = False
+            if update_status and hasattr(self, "status_label"):
+                self.status_label.setText(f"Sync base cmd failed: {exc}")
+                self.status_label.setStyleSheet("QLabel { color: red; font-size: 10px; }")
+        if update_status and ok and hasattr(self, "status_label"):
+            self.status_label.setText("Synced command base x/y/theta from observation")
+            self.status_label.setStyleSheet("QLabel { color: #1e88e5; font-size: 10px; }")
+        elif update_status and (not ok) and hasattr(self, "status_label"):
+            self.status_label.setText("Sync base cmd failed: no valid observation")
+            self.status_label.setStyleSheet("QLabel { color: orange; font-size: 10px; }")
+        if hasattr(self, "_update_joint_state_table"):
+            try:
+                self._update_joint_state_table()
+            except Exception:
+                pass
+        return ok
+
+    def _on_sync_base_cmd_clicked(self):
+        self._sync_base_cmd_from_observation(update_status=True)
+
+    def _on_sync_joints_cmd_clicked(self):
+        ok = False
+        try:
+            if hasattr(self.ros_node, "sync_nonbase_command_joints_to_observation"):
+                ok = bool(self.ros_node.sync_nonbase_command_joints_to_observation())
+        except Exception as exc:
+            ok = False
+            if hasattr(self, "status_label"):
+                self.status_label.setText(f"Sync joints cmd failed: {exc}")
+                self.status_label.setStyleSheet("QLabel { color: red; font-size: 10px; }")
+        if ok and hasattr(self, "status_label"):
+            self.status_label.setText("Synced command 8 joints from observation")
+            self.status_label.setStyleSheet("QLabel { color: #1e88e5; font-size: 10px; }")
+        elif (not ok) and hasattr(self, "status_label"):
+            self.status_label.setText("Sync joints cmd failed: no valid observation")
+            self.status_label.setStyleSheet("QLabel { color: orange; font-size: 10px; }")
+        self._update_joint_state_table()
+
+    def _on_home_pose_clicked(self):
+        self._set_status("Sending robot to startup home pose...", "QLabel { color: #1e88e5; font-size: 10px; }")
+
+        def run():
+            try:
+                ok = False
+                if hasattr(self.ros_node, "move_to_startup_home_pose"):
+                    ok = bool(self.ros_node.move_to_startup_home_pose(timeout_s=14.0))
+                if ok:
+                    try:
+                        if isinstance(DEFAULT_INIT_CMD_QPOS8, (list, tuple)) and len(DEFAULT_INIT_CMD_QPOS8) >= 8:
+                            self._set_manual_gripper_override(float(DEFAULT_INIT_CMD_QPOS8[7]))
+                    except Exception:
+                        pass
+                    self._set_status("Home pose reached.", "QLabel { color: green; font-size: 10px; }")
+                else:
+                    self._set_status("Home pose command failed.", "QLabel { color: red; font-size: 10px; }")
+            except Exception as exc:
+                self._set_status(f"Home pose failed: {exc}", "QLabel { color: red; font-size: 10px; }")
+            finally:
+                try:
+                    self._update_joint_state_table()
+                except Exception:
+                    pass
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _update_joint_state_table(self):
+        if not hasattr(self, "joint_state_table"):
+            return
+        try:
+            sensors = self.ros_node.get_sensor_snapshot()
+        except Exception:
+            return
+
+        cmd_q = sensors.get("observation.qpos_published")
+        obs_q = sensors.get("observation.qpos_actual")
+        cmd_pose = sensors.get("observation.command_base_pose_xytheta")
+        obs_pose = sensors.get("observation.base_pose_xytheta")
+
+        if not isinstance(cmd_q, list):
+            cmd_q = []
+        if not isinstance(obs_q, list):
+            obs_q = []
+        if not (isinstance(cmd_pose, list) and len(cmd_pose) >= 3):
+            cmd_pose = [0.0, 0.0, 0.0]
+        if not (isinstance(obs_pose, list) and len(obs_pose) >= 3):
+            obs_pose = [0.0, 0.0, 0.0]
+
+        cmd10 = [float(v) for v in cmd_q[:10]] + [0.0] * max(0, 10 - len(cmd_q))
+        obs10 = [float(v) for v in obs_q[:10]] + [0.0] * max(0, 10 - len(obs_q))
+        cmd_vals = cmd10[:8] + [float(cmd_pose[0]), float(cmd_pose[1]), float(cmd_pose[2])]
+        obs_vals = obs10[:8] + [float(obs_pose[0]), float(obs_pose[1]), float(obs_pose[2])]
+
+        for row, (cmd_v, obs_v) in enumerate(zip(cmd_vals, obs_vals)):
+            self.joint_state_table.item(row, 1).setText(f"{cmd_v:+.5f}")
+            self.joint_state_table.item(row, 2).setText(f"{obs_v:+.5f}")
+
+    def create_object_list(self):
+        """Create object list widget"""
+        widget = QGroupBox("Detected Objects")
+        layout = QVBoxLayout()
+
+        # List widget (scrollable)
+        self.object_list = QListWidget()
+        self.object_list.itemClicked.connect(self.on_object_selected)
+        self.object_list.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        layout.addWidget(self.object_list, stretch=1)
+
+        # Action buttons
+        btn_layout = QHBoxLayout()
+
+        self.center_button = QPushButton("Center")
+        self.center_button.setToolTip("Center camera on selected object")
+        self.center_button.clicked.connect(self.center_camera_on_object)
+        self.center_button.setEnabled(False)
+        self.center_button.setMinimumHeight(35)
+        btn_layout.addWidget(self.center_button)
+
+        self.reach_button = QPushButton("Reach")
+        self.reach_button.setToolTip("Move arm above selected object (10cm clearance)")
+        self.reach_button.clicked.connect(self.reach_object)
+        self.reach_button.setEnabled(False)
+        self.reach_button.setMinimumHeight(35)
+        btn_layout.addWidget(self.reach_button)
+
+        self.grasp_button = QPushButton("Grasp")
+        self.grasp_button.setToolTip("Move to and grasp selected object")
+        self.grasp_button.clicked.connect(self.grasp_object)
+        self.grasp_button.setEnabled(False)
+        self.grasp_button.setMinimumHeight(35)
+        btn_layout.addWidget(self.grasp_button)
+
+        layout.addLayout(btn_layout)
+
+        # Return button (full width, below action buttons)
+        self.return_button = QPushButton("Return")
+        self.return_button.setToolTip("Return arm and base to position before last reach/grasp")
+        self.return_button.clicked.connect(self.return_to_start)
+        self.return_button.setEnabled(False)
+        self.return_button.setMinimumHeight(35)
+        layout.addWidget(self.return_button)
+        self.return_shortcut = QShortcut(QKeySequence("Shift"), self)
+        self.return_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
+        self.return_shortcut.activated.connect(self._on_return_shortcut)
+
+        # Play/Pause/Continue button for long actions
+        self.play_pause_button = QPushButton("Pause")
+        self.play_pause_button.setToolTip("Pause running action / Continue paused action")
+        self.play_pause_button.clicked.connect(self.on_play_pause_clicked)
+        self.play_pause_button.setEnabled(False)
+        self.play_pause_button.setMinimumHeight(35)
+        layout.addWidget(self.play_pause_button)
+        self.space_pause_shortcut = QShortcut(QKeySequence("Space"), self)
+        self.space_pause_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
+        self.space_pause_shortcut.activated.connect(self._on_space_pause_shortcut)
+
+        self.next_goal_button = QPushButton("Go To Next Goal")
+        self.next_goal_button.setToolTip("Execute next queued goal (or skip current action and move to next queued goal)")
+        self.next_goal_button.clicked.connect(self.go_to_next_goal)
+        self.next_goal_button.setEnabled(False)
+        self.next_goal_button.setMinimumHeight(35)
+        layout.addWidget(self.next_goal_button)
+
+        self.goal_queue_label = QLabel("Queued goals: (none)")
+        self.goal_queue_label.setStyleSheet("QLabel { color: gray; font-size: 10px; }")
+        self.goal_queue_label.setWordWrap(True)
+        layout.addWidget(self.goal_queue_label)
+
+        # Manual region-based grasp workflow (v8).
+        manual_group = QGroupBox("Manual Grasp Regions")
+        manual_layout = QVBoxLayout()
+        manual_layout.setSpacing(4)
+
+        self.manual_region_tree = QTreeWidget()
+        self.manual_region_tree.setHeaderLabels(["Region / Grasp Points"])
+        self.manual_region_tree.setMinimumHeight(120)
+        self.manual_region_tree.setMaximumHeight(220)
+        self.manual_region_tree.setSelectionMode(QTreeWidget.SelectionMode.SingleSelection)
+        self.manual_region_tree.itemSelectionChanged.connect(self._on_manual_region_tree_selection_changed)
+        manual_layout.addWidget(self.manual_region_tree)
+
+        manual_btn_row1 = QHBoxLayout()
+        self.manual_compute_button = QPushButton("Compute Grasp")
+        self.manual_compute_button.setToolTip("Compute grasp orientation from selected region + points")
+        self.manual_compute_button.clicked.connect(self.compute_selected_manual_region_grasp)
+        manual_btn_row1.addWidget(self.manual_compute_button)
+
+        self.manual_align_button = QPushButton("Align Gripper")
+        self.manual_align_button.setToolTip("Align wrist yaw/pitch only; no reach/base move")
+        self.manual_align_button.clicked.connect(self.align_gripper_to_selected_manual_region)
+        manual_btn_row1.addWidget(self.manual_align_button)
+        manual_layout.addLayout(manual_btn_row1)
+
+        manual_btn_row2 = QHBoxLayout()
+        self.manual_execute_button = QPushButton("Execute Region Grasp")
+        self.manual_execute_button.setToolTip("Run IK grasp execution for selected region")
+        self.manual_execute_button.clicked.connect(self.execute_selected_manual_region_grasp)
+        manual_btn_row2.addWidget(self.manual_execute_button)
+
+        self.manual_delete_button = QPushButton("Delete Region")
+        self.manual_delete_button.setToolTip("Delete selected manual region entry")
+        self.manual_delete_button.clicked.connect(self.delete_selected_manual_region)
+        manual_btn_row2.addWidget(self.manual_delete_button)
+        manual_layout.addLayout(manual_btn_row2)
+
+        manual_hint = QLabel(
+            "Right-click image -> Draw Grasp Rectangle. Then click 2 grip-tip points inside it."
+        )
+        manual_hint.setWordWrap(True)
+        manual_hint.setStyleSheet("QLabel { color: gray; font-size: 10px; }")
+        manual_layout.addWidget(manual_hint)
+        manual_group.setLayout(manual_layout)
+        layout.addWidget(manual_group)
+
+        # Demonstration recording controls
+        record_group = QGroupBox("LeRobot Demo Recording")
+        record_layout = QGridLayout()
+        record_layout.setSpacing(4)
+
+        record_layout.addWidget(QLabel("Prompt"), 0, 0)
+        self.prompt_input = QLineEdit()
+        self.prompt_input.setPlaceholderText("e.g. pick up the red block and place it in the tray")
+        self.prompt_input.textChanged.connect(self.on_prompt_changed)
+        record_layout.addWidget(self.prompt_input, 0, 1, 1, 2)
+
+        record_layout.addWidget(QLabel("Folder"), 1, 0)
+        self.record_folder_input = QLineEdit(self.dataset_root)
+        self.record_folder_input.textChanged.connect(self.on_record_folder_changed)
+        record_layout.addWidget(self.record_folder_input, 1, 1)
+
+        self.browse_record_folder_button = QPushButton("Browse")
+        self.browse_record_folder_button.clicked.connect(self.browse_record_folder)
+        self.browse_record_folder_button.setMinimumHeight(30)
+        record_layout.addWidget(self.browse_record_folder_button, 1, 2)
+
+        record_layout.addWidget(QLabel("RGB Format"), 2, 0)
+        self.record_rgb_format_combo = QComboBox()
+        self.record_rgb_format_combo.addItems(["jpg", "png"])
+        self.record_rgb_format_combo.setCurrentText(self.record_rgb_format)
+        self.record_rgb_format_combo.currentTextChanged.connect(self.on_record_rgb_format_changed)
+        record_layout.addWidget(self.record_rgb_format_combo, 2, 1, 1, 2)
+
+        self.record_toggle_button = QPushButton("Record")
+        self.record_toggle_button.setMinimumHeight(35)
+        self.record_toggle_button.setToolTip("Start/stop recording demonstration in LeRobot-style layout")
+        self.record_toggle_button.clicked.connect(self.toggle_demo_recording)
+        record_layout.addWidget(self.record_toggle_button, 3, 0, 1, 3)
+        self.record_shortcut_r = QShortcut(QKeySequence("R"), self)
+        self.record_shortcut_r.setContext(Qt.ShortcutContext.ApplicationShortcut)
+        self.record_shortcut_r.activated.connect(self._on_record_shortcut)
+        self.execute_goals_shortcut = QShortcut(QKeySequence("E"), self)
+        self.execute_goals_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
+        self.execute_goals_shortcut.activated.connect(self._on_execute_goals_shortcut)
+
+        record_group.setLayout(record_layout)
+        layout.addWidget(record_group)
+
+        # Status label
+        self.status_label = QLabel("No segmentation yet")
+        self.status_label.setStyleSheet("QLabel { color: gray; font-size: 10px; }")
+        self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.status_label.setWordWrap(True)
+        self.status_label.setMaximumHeight(60)
+        layout.addWidget(self.status_label)
+
+        widget.setLayout(layout)
+        return widget
+
+    def _set_action_state(self, state):
+        """Thread-safe action-state update (logic state + UI state)."""
+        with self._action_lock:
+            self._action_state = state
+        self.ui_action_state_signal.emit(state)
+
+    def _apply_action_state_ui(self, state):
+        """Apply action-state visuals on the Qt thread."""
+        if state == 'idle':
+            self.play_pause_button.setEnabled(False)
+            self.play_pause_button.setText("Pause")
+        elif state == 'running':
+            self.play_pause_button.setEnabled(True)
+            self.play_pause_button.setText("Pause")
+        elif state in ('paused', 'awaiting_confirm'):
+            self.play_pause_button.setEnabled(True)
+            self.play_pause_button.setText("Continue")
+            self.return_button.setEnabled(True)
+        elif state == 'awaiting_post_grasp':
+            self.play_pause_button.setEnabled(True)
+            self.play_pause_button.setText("Continue")
+            self.return_button.setEnabled(True)
+        self._update_next_goal_button_state()
+
+    def _goal_sequence_order(self):
+        goals = []
+        if self.queued_goals.get("grasp") is not None:
+            goals.append(self.queued_goals["grasp"])
+        if self.queued_goals.get("reach") is not None:
+            goals.append(self.queued_goals["reach"])
+        return goals
+
+    def _goal_sequence_has_next(self):
+        return self.queued_goal_cursor < len(self._goal_sequence_order())
+
+    def _update_goal_queue_label(self):
+        goals = self._goal_sequence_order()
+        if not hasattr(self, "goal_queue_label"):
+            return
+        if not goals:
+            self.goal_queue_label.setText("Queued goals: (none)")
+            self.goal_queue_label.setStyleSheet("QLabel { color: gray; font-size: 10px; }")
+            return
+        labels = []
+        for idx, g in enumerate(goals):
+            prefix = "-> " if idx == self.queued_goal_cursor and self._goal_sequence_has_next() else "   "
+            labels.append(f"{prefix}{idx+1}. {g['kind']} ({g['px']},{g['py']})")
+        self.goal_queue_label.setText("Queued goals:\n" + "\n".join(labels))
+        self.goal_queue_label.setStyleSheet("QLabel { color: #555; font-size: 10px; }")
+
+    def _update_next_goal_button_state(self):
+        if not hasattr(self, "next_goal_button"):
+            return
+        with self._action_lock:
+            st = self._action_state
+        enabled = False
+        if self._goal_sequence_has_next():
+            # Allow starting next goal from idle, or skipping to next during an active/paused action.
+            enabled = st in ('idle', 'running', 'paused', 'awaiting_confirm')
+        self.next_goal_button.setEnabled(enabled)
+
+    def _reset_goal_sequence_progress(self):
+        self.queued_goal_cursor = 0
+        self.queued_sequence_started = False
+        self._deferred_next_goal_start = False
+        self._skip_to_next_goal_requested = False
+        self._update_goal_queue_label()
+        self._update_next_goal_button_state()
+
+    def _apply_status_update(self, text, style):
+        self.status_label.setText(text)
+        if style:
+            self.status_label.setStyleSheet(style)
+
+    def _set_status(self, text, style=None):
+        msg = str(text)
+        print(f"[ui_status] {msg}", flush=True)
+        self.ui_status_signal.emit(msg, style or "")
+
+    def _update_device_yaw_mode_button(self) -> None:
+        if not hasattr(self, "device_yaw_mode_button"):
+            return
+        if bool(getattr(self, "device_yaw_reverse", False)):
+            self.device_yaw_mode_button.setText("Yaw Mode: Reverse")
+            self.device_yaw_mode_button.setToolTip("Device yaw sign is inverted before sending")
+        else:
+            self.device_yaw_mode_button.setText("Yaw Mode: Normal")
+            self.device_yaw_mode_button.setToolTip("Device yaw sign is sent directly")
+
+    def _toggle_device_yaw_mode(self) -> None:
+        self.device_yaw_reverse = not bool(getattr(self, "device_yaw_reverse", False))
+        self._update_device_yaw_mode_button()
+        mode = "reverse" if self.device_yaw_reverse else "normal"
+        self._set_status(f"Device yaw mode: {mode}", "QLabel { color: #1e88e5; font-size: 10px; }")
+
+    def _set_return_enabled(self, enabled):
+        self.ui_return_enabled_signal.emit(bool(enabled))
+
+    def _begin_action(self, mode):
+        """Start a new reach/grasp action if none is running."""
+        with self._action_lock:
+            if self._action_state != 'idle':
+                return False
+            self._action_mode = mode
+            self._action_abort_requested = False
+            self._action_state = 'running'
+        self._set_action_state('running')
+        self.return_button.setEnabled(False)
+        return True
+
+    def _is_abort_requested(self):
+        with self._action_lock:
+            return self._action_abort_requested
+
+    def on_play_pause_clicked(self):
+        """Pause/continue active action. In post-grasp hold, Continue triggers lift."""
+        with self._action_lock:
+            state = self._action_state
+
+        if state == 'running':
+            self._set_action_state('paused')
+            self.status_label.setText("Paused. Press Continue or Return.")
+            self.status_label.setStyleSheet("QLabel { color: orange; font-size: 10px; }")
+            return
+
+        if state in ('paused', 'awaiting_confirm'):
+            self._set_action_state('running')
+            self.status_label.setText("Resuming action...")
+            self.status_label.setStyleSheet("QLabel { color: blue; font-size: 10px; }")
+            return
+
+        if state == 'awaiting_post_grasp':
+            self._set_action_state('running')
+            self.status_label.setText("Resuming action...")
+            self.status_label.setStyleSheet("QLabel { color: blue; font-size: 10px; }")
+
+    def _on_space_pause_shortcut(self) -> None:
+        if not hasattr(self, "play_pause_button"):
+            return
+        if not self.play_pause_button.isEnabled():
+            return
+        self.on_play_pause_clicked()
+
+    def _on_return_shortcut(self) -> None:
+        if self._text_input_has_focus():
+            return
+        if not hasattr(self, "return_button"):
+            return
+        if not self.return_button.isEnabled():
+            return
+        self.return_to_start()
+
+    def _text_input_has_focus(self) -> bool:
+        fw = QApplication.focusWidget()
+        return isinstance(fw, QLineEdit)
+
+    def _on_record_shortcut(self) -> None:
+        if self._text_input_has_focus():
+            return
+        if hasattr(self, "record_toggle_button") and self.record_toggle_button.isEnabled():
+            self.toggle_demo_recording()
+
+    def _on_execute_goals_shortcut(self) -> None:
+        if self._text_input_has_focus():
+            return
+        if hasattr(self, "execute_goals_button") and self.execute_goals_button.isEnabled():
+            self.execute_all_queued_goals()
+
+    @staticmethod
+    def _quat_to_yaw_rad(quat: list[Any] | tuple[Any, ...] | None) -> float | None:
+        if not isinstance(quat, (list, tuple)) or len(quat) < 4:
+            return None
+        try:
+            x = float(quat[0])
+            y = float(quat[1])
+            z = float(quat[2])
+            w = float(quat[3])
+        except (TypeError, ValueError):
+            return None
+        if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(z) and math.isfinite(w)):
+            return None
+        # ZYX yaw from quaternion.
+        siny_cosp = 2.0 * (w * z + x * y)
+        cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+        return float(math.atan2(siny_cosp, cosy_cosp))
+
+    @staticmethod
+    def _wrap_angle_rad(a: float) -> float:
+        return float(math.atan2(math.sin(a), math.cos(a)))
+
+    @staticmethod
+    def _build_prec_step_dict(min_val: float, max_val: float) -> dict[int, float]:
+        """Map prec levels 0..4 to 5 linearly spaced step sizes (max -> min)."""
+        lo = float(min_val)
+        hi = float(min_val) + (float(max_val) - float(min_val)) / 3.0
+        vals = np.linspace(hi, lo, int(DEVICE_PREC_LEVELS))
+        return {idx: float(vals[idx]) for idx in range(int(DEVICE_PREC_LEVELS))}
+
+    def _device_step_from_prec(self, *, prec_level: int, min_val: float, max_val: float) -> float:
+        mp = self._build_prec_step_dict(min_val=min_val, max_val=max_val)
+        p = int(np.clip(int(prec_level), 0, int(DEVICE_PREC_LEVELS) - 1))
+        return float(mp[p])
+
+    def _poll_device_control(self) -> None:
+        if not getattr(self, "_device_input_ok", False):
+            return
+        packets = self.device_bridge.drain()
+        if len(packets) == 0:
+            return
+        dead = float(DEVICE_ENCODER_DEADBAND)
+        for payload in packets:
+            raw = payload.get("raw")
+            if not isinstance(raw, list) or len(raw) < 10:
+                continue
+            try:
+                enc1 = float(raw[6])  # encoder-1: base fwd/back
+                enc2 = float(raw[7])  # encoder-2: lift
+                enc3 = float(raw[8])  # encoder-3: arm (or gripper when button-1 held)
+                b1 = bool(int(float(raw[9])))  # button-1: gripper mode
+                b2 = bool(int(float(raw[10])))  # button-2: wrist yaw mode
+                precision = max(0.0, float(raw[4]))
+                mode = int(float(raw[3]))
+            except (TypeError, ValueError, IndexError):
+                continue
+            if not (
+                math.isfinite(enc1) and math.isfinite(enc2) and math.isfinite(enc3) and math.isfinite(precision)
+            ):
+                continue
+
+            if bool(DEVICE_DEBUG_PRINT) and self._device_debug_print_count < int(DEVICE_DEBUG_PRINT_MAX):
+                print(
+                    "[device] decoded raw "
+                    f"mode={mode} prec={precision:.3f} "
+                    f"enc1={enc1:+.3f} enc2={enc2:+.3f} enc3={enc3:+.3f} "
+                    f"b1={int(b1)} b2={int(b2)}"
+                )
+                self._device_debug_print_count += 1
+
+            # Precision selection requested:
+            # rem = prec % 2 -> {0,1}; map 0->level 3, 1->level 4
+            prec_raw = int(np.clip(int(round(float(precision))), 0, int(DEVICE_PREC_LEVELS) - 1))
+            prec_mod = int(prec_raw % 2)
+            prec_level = 3 if prec_mod == 0 else 4
+            self._device_prec_level = int(prec_mod)
+            if hasattr(self, "device_prec_label"):
+                self.device_prec_label.setText(f"Device Prec: {prec_mod} (lvl {prec_level})")
+
+            # Map each joint step from slider-range [min,max] via linspace with inverse precision mapping.
+            base_step_size = self._device_step_from_prec(
+                prec_level=prec_level,
+                min_val=float(DEVICE_BASE_STEP_MIN_M),
+                max_val=float(DEVICE_BASE_STEP_MAX_M),
+            )
+            arm_step_size = self._device_step_from_prec(
+                prec_level=prec_level,
+                min_val=float(DEVICE_ARM_STEP_MIN),
+                max_val=float(DEVICE_ARM_STEP_MAX),
+            )
+            # Apply only when encoder values change; each changed sample contributes:
+            #   new_cmd = current_cmd + encoder_value * step
+            changed1 = True
+            changed2 = True
+            changed3 = True
+
+            any_joint_cmd = False
+
+            # Encoder-1: base forward/backward (manual absolute-base-x path as in v9).
+            if changed1 and abs(enc1) > dead:
+                base_step = -enc1 * base_step_size
+                self.ros_node._send_manual_base_x_absolute_step(
+                    step_dx=float(base_step),
+                    timeout_s=max(1.5, 2.0 + 4.0 * abs(float(base_step))),
+                )
+
+            # Encoder-2: lift (cmd_action += delta).
+            if changed2 and abs(enc2) > dead:
+                delta_lift = -enc2 * arm_step_size
+                cur = self.ros_node.get_target_qpos()
+                if isinstance(cur, list) and len(cur) >= 2:
+                    lo, hi = self.ros_node.JOINT_LIMITS[1]
+                    tgt = float(np.clip(float(cur[1]) + float(delta_lift), lo, hi))
+                    self.robot_controller.set_control("arm_lift", tgt)
+                    any_joint_cmd = True
+
+            # Encoder-3: always controls arm extension.
+            if changed3 and abs(enc3) > dead:
+                delta_arm = -enc3 * arm_step_size
+                cur = self.ros_node.get_target_qpos()
+                if isinstance(cur, list) and len(cur) >= 1:
+                    lo, hi = self.ros_node.JOINT_LIMITS[0]
+                    tgt = float(np.clip(float(cur[0]) + float(delta_arm), lo, hi))
+                    self.robot_controller.set_control("arm_extension", tgt)
+                    any_joint_cmd = True
+
+            # Button-1: edge-triggered gripper toggle (independent of encoder-3).
+            b1_rising = bool(b1) and (not bool(self._device_b1_prev_pressed))
+            self._device_b1_prev_pressed = bool(b1)
+            if b1_rising:
+                grip_open = 0.16
+                grip_close = 0.06
+                target = grip_open if bool(self._device_b1_open_next) else grip_close
+                self._device_b1_open_next = not bool(self._device_b1_open_next)
+                self.set_gripper(float(target))
+                any_joint_cmd = True
+
+            # Yaw from device is applied around current wrist yaw baseline:
+            # target_yaw = baseline_wrist_yaw + device_yaw (optionally sign-reversed).
+            yaw_now = self._quat_to_yaw_rad(payload.get("quat"))
+            # print(yaw_now)
+            if yaw_now is None:
+                self._device_b1_active = False
+                continue
+            if False: # b1
+                if not bool(self._device_b1_active):
+                    self._device_b1_active = True
+                    q_target = self.ros_node.get_target_qpos()
+                    wrist_ref = 0.0
+                    if isinstance(q_target, list) and len(q_target) >= 3:
+                        try:
+                            wrist_ref = float(q_target[2])
+                        except (TypeError, ValueError):
+                            wrist_ref = 0.0
+                    self._device_b1_wrist_ref = wrist_ref
+
+                yaw_cmd = -float(yaw_now) if bool(getattr(self, "device_yaw_reverse", False)) else float(yaw_now)
+                lo_yaw, hi_yaw = self.ros_node.JOINT_LIMITS[2]
+                base_yaw = float(self._device_b1_wrist_ref) if self._device_b1_wrist_ref is not None else 0.0
+                target_yaw = float(np.clip(float(base_yaw + yaw_cmd), float(lo_yaw), float(hi_yaw)))
+                self.robot_controller.set_control("wrist_yaw", target_yaw)
+                any_joint_cmd = True
+            else:
+                self._device_b1_active = False
+                self._device_b1_wrist_ref = None
+
+            if any_joint_cmd:
+                try:
+                    self.ros_node.publish_commands(force=False)
+                except Exception:
+                    pass
+
+    def start_control(self, control_name, value):
+        """Start continuous control (velocity-based)"""
+        self.robot_controller.set_control(control_name, value)
+
+    def start_control_incremental(self, control_name, delta):
+        """Start incremental control (position-based)"""
+        # Safety: if base command is still latched, clear it before non-base holds.
+        if control_name not in ("base_linear", "base_angular"):
+            try:
+                if self.ros_node.is_base_command_active():
+                    self.ros_node.stop_base()
+            except Exception:
+                pass
+        # For position controls, we use a timer to apply incremental changes
+        if not hasattr(self, 'control_timers'):
+            self.control_timers = {}
+
+        if control_name in self.control_timers and self.control_timers[control_name].isActive():
+            return
+
+        def apply_increment():
+            self.robot_controller.adjust_control(control_name, delta)
+
+        timer = QTimer()
+        timer.timeout.connect(apply_increment)
+        timer.start(50)  # 20Hz updates
+        self.control_timers[control_name] = timer
+
+    def stop_control(self, control_name):
+        """Stop continuous control"""
+        # Stop velocity-based controls
+        if control_name in ['base_linear', 'base_angular']:
+            self.robot_controller.set_control(control_name, 0.0)
+
+        # Stop incremental timers
+        if hasattr(self, 'control_timers') and control_name in self.control_timers:
+            self.control_timers[control_name].stop()
+
+    def set_gripper(self, value):
+        """Set gripper state"""
+        lo, hi = self.ros_node.JOINT_LIMITS[7]
+        try:
+            clipped = float(np.clip(float(value), lo, hi))
+        except (TypeError, ValueError):
+            return
+        self._set_manual_gripper_override(clipped)
+        self.robot_controller.set_control('gripper', clipped)
+
+    def _set_manual_gripper_override(self, value: float | None) -> None:
+        if value is None or not isinstance(value, (int, float)):
+            self._manual_gripper_override = None
+            return
+        try:
+            v = float(value)
+            if not math.isfinite(v):
+                self._manual_gripper_override = None
+                return
+        except (TypeError, ValueError):
+            self._manual_gripper_override = None
+            return
+        lo, hi = self.ros_node.JOINT_LIMITS[7]
+        self._manual_gripper_override = float(np.clip(v, lo, hi))
+
+    def _get_manual_gripper_target(self, fallback: float | None = None) -> float | None:
+        if self._manual_gripper_override is not None:
+            return float(self._manual_gripper_override)
+
+        target = self.ros_node.get_target_qpos()
+        if isinstance(target, list) and len(target) >= 8:
+            try:
+                v = float(target[7])
+                if math.isfinite(v):
+                    lo, hi = self.ros_node.JOINT_LIMITS[7]
+                    return float(np.clip(v, lo, hi))
+            except (TypeError, ValueError):
+                pass
+
+        actual = self.ros_node.get_actual_qpos()
+        if isinstance(actual, list) and len(actual) >= 8:
+            try:
+                v = float(actual[7])
+                if math.isfinite(v):
+                    lo, hi = self.ros_node.JOINT_LIMITS[7]
+                    return float(np.clip(v, lo, hi))
+            except (TypeError, ValueError):
+                pass
+
+        return None if fallback is None else float(fallback)
+
+    def on_prompt_changed(self, text):
+        self.record_prompt = text
+
+    def on_record_folder_changed(self, text):
+        self.dataset_root = text.strip()
+
+    def on_record_rgb_format_changed(self, text):
+        fmt = str(text or DEMO_RECORD_RGB_DEFAULT_FORMAT).strip().lower()
+        if fmt == "jpeg":
+            fmt = "jpg"
+        if fmt not in {"jpg", "png"}:
+            fmt = str(DEMO_RECORD_RGB_DEFAULT_FORMAT).lower()
+        self.record_rgb_format = fmt
+
+    def browse_record_folder(self):
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Select LeRobot Dataset Folder",
+            self.dataset_root or str(Path.cwd()),
+        )
+        if folder:
+            self.dataset_root = folder
+            self.record_folder_input.setText(folder)
+
+    def _build_record_sample(self):
+        sensors = self.ros_node.get_sensor_snapshot()
+        aligned: dict[str, Any] | None = None
+        if hasattr(self.ros_node, "get_aligned_record_components"):
+            try:
+                aligned = self.ros_node.get_aligned_record_components()
+            except Exception:
+                aligned = None
+
+        if isinstance(aligned, dict):
+            actual_qpos = list(aligned.get("actual_qpos10") or [])
+            command_qpos = list(aligned.get("command_qpos10") or [])
+            measured_pose = list(aligned.get("measured_pose_xytheta") or [0.0, 0.0, 0.0])
+            command_pose = list(aligned.get("command_pose_xytheta") or measured_pose)
+            sample_ts = float(aligned.get("timestamp", time.time()))
+            head_rgb = aligned.get("head_rgb")
+            wrist_rgb = aligned.get("wrist_rgb")
+            head_depth = aligned.get("head_depth")
+            wrist_depth = aligned.get("wrist_depth")
+            sensors["observation.sync.reference_stamp_ns"] = aligned.get("reference_stamp_ns")
+            sensors["observation.sync.aligned_joint_stamp_ns"] = aligned.get("aligned_joint_stamp_ns")
+            sensors["observation.sync.aligned_odom_stamp_ns"] = aligned.get("aligned_odom_stamp_ns")
+            sensors["observation.sync.topic_stamp_ns"] = aligned.get("stamp_ns_map", {})
+            cmd_event = aligned.get("command_event")
+            if isinstance(cmd_event, dict):
+                sensors["action_command.sent_wall_time_ns"] = cmd_event.get("wall_time_ns")
+                sensors["action_command.sent_ros_time_ns_est"] = cmd_event.get("ros_time_ns_est")
+                sensors["action_command.source"] = cmd_event.get("reason")
+            sensors["action_command.manip_base_x"] = aligned.get("command_manip_base_x")
+        else:
+            actual_qpos = self.ros_node.get_actual_qpos()
+            command_qpos = self.ros_node.get_published_qpos()
+            measured_pose = self.ros_node.get_measured_base_pose_xytheta() or [0.0, 0.0, 0.0]
+            command_pose = self.ros_node.get_command_base_pose_xytheta() or list(measured_pose)
+            sample_ts = time.time()
+            head_rgb = self.head_rgb if self.head_rgb is not None else None
+            wrist_rgb = self.wrist_rgb if self.wrist_rgb is not None else None
+            head_depth = self.depth_image if self.depth_image is not None else None
+            wrist_depth = self.wrist_depth if self.wrist_depth is not None else None
+
+        # Raw state is the exact 10D measured qpos vector used internally:
+        # [first 8 joint positions, base linear vel, base angular vel]
+        state_raw_v5 = list(actual_qpos) if actual_qpos else []
+        action_raw_v5 = list(actual_qpos) if actual_qpos else []
+        action_command_raw_v5 = list(command_qpos) if command_qpos else []
+
+        state = state_raw_v5[:8] + [float(v) for v in measured_pose]
+        action = action_raw_v5[:8] + [float(v) for v in measured_pose]
+        action_command = action_command_raw_v5[:8] + [float(v) for v in command_pose]
+
+        sensors["observation.state_raw_v5"] = state_raw_v5
+        sensors["observation.qpos_actual_raw_v5"] = action_raw_v5
+        sensors["observation.qpos_full_raw_v5"] = action_command_raw_v5
+        sensors["action_raw_v5"] = action_raw_v5
+        sensors["action_command_raw_v5"] = action_command_raw_v5
+
+        return {
+            "timestamp": sample_ts,
+            "head_rgb": head_rgb,
+            "wrist_rgb": wrist_rgb,
+            "head_depth": head_depth,
+            "wrist_depth": wrist_depth,
+            "state": state,
+            "action": action,
+            "action_command": action_command,
+            "sensors": sensors,
+        }
+
+    def start_demo_recording(self):
+        if self.is_recording_demo:
+            return
+        if not self.dataset_root:
+            self.status_label.setText("Set a recording folder first")
+            self.status_label.setStyleSheet("QLabel { color: red; font-size: 10px; }")
+            return
+        prompt = (self.record_prompt or "").strip()
+        if not prompt:
+            prompt = "unspecified_task"
+            self.prompt_input.setText(prompt)
+        try:
+            self.demo_recorder.start(
+                self.dataset_root,
+                prompt,
+                rgb_image_format=self.record_rgb_format,
+                rgb_jpeg_quality=self.record_rgb_jpeg_quality,
+            )
+            self.is_recording_demo = True
+            self.record_toggle_button.setText("Stop Recording")
+            self.status_label.setText(
+                f"Recording demo: {prompt} (fps={self.demo_recorder.target_fps:.1f}, rgb={self.record_rgb_format})"
+            )
+            self.status_label.setStyleSheet("QLabel { color: #1e88e5; font-size: 10px; }")
+        except Exception as e:
+            self.status_label.setText(f"Record start failed: {e}")
+            self.status_label.setStyleSheet("QLabel { color: red; font-size: 10px; }")
+
+    def stop_demo_recording(self):
+        if not self.is_recording_demo:
+            return
+        try:
+            # Freeze recording at stop-click time (do not capture frames while popup is open).
+            self.is_recording_demo = False
+            self.record_toggle_button.setText("Record")
+            choice = QMessageBox.question(
+                self,
+                "Stop Recording",
+                "Save this episode?\n\nYes: save episode\nNo: discard episode and delete recorded files",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            discard = choice == QMessageBox.StandardButton.No
+            summary = self.demo_recorder.stop(discard=discard)
+            if discard:
+                ep = summary.get("episode_index", "?") if isinstance(summary, dict) else "?"
+                self.status_label.setText(
+                    f"Discarded demo ep {ep} (deleted recorded files)"
+                )
+                self.status_label.setStyleSheet("QLabel { color: #ff9800; font-size: 10px; }")
+            else:
+                sync_ok = self._sync_base_cmd_from_observation(update_status=False)
+                if summary is None:
+                    self.status_label.setText(
+                        f"Recording stopped (base cmd sync: {'ok' if sync_ok else 'failed'})"
+                    )
+                    self.status_label.setStyleSheet("QLabel { color: green; font-size: 10px; }")
+                else:
+                    self.status_label.setText(
+                        f"Saved demo ep {summary['episode_index']} "
+                        f"({summary['num_frames']} frames, dropped={summary.get('dropped_frames', 0)}, "
+                        f"base_sync={'ok' if sync_ok else 'failed'})"
+                    )
+                    self.status_label.setStyleSheet("QLabel { color: green; font-size: 10px; }")
+                    print(f"Demo saved: {summary}")
+        except Exception as e:
+            self.status_label.setText(f"Record stop failed: {e}")
+            self.status_label.setStyleSheet("QLabel { color: red; font-size: 10px; }")
+
+    def toggle_demo_recording(self):
+        if self.is_recording_demo:
+            self.stop_demo_recording()
+        else:
+            self.start_demo_recording()
+
+    def adjust_gripper_step(self, direction):
+        """Incrementally open/close gripper by configured step size."""
+        grip_min, grip_max = self.ros_node.JOINT_LIMITS[7]
+        getter = getattr(self, "_get_manual_gripper_target", None)
+        if getter is None and self.ros_node is not None:
+            getter = getattr(self.ros_node, "_get_manual_gripper_target", None)
+        if callable(getter):
+            current = getter(fallback=float(self.ros_node.JOINT_LIMITS[7][1]))
+        else:
+            target = self.ros_node.get_target_qpos()
+            if isinstance(target, list) and len(target) >= 8:
+                try:
+                    current = float(target[7])
+                except (TypeError, ValueError):
+                    current = float(self.ros_node.JOINT_LIMITS[7][1])
+            else:
+                current = float(self.ros_node.JOINT_LIMITS[7][1])
+        if current is None:
+            try:
+                current = float(self.ros_node.JOINT_LIMITS[7][1])
+            except (TypeError, ValueError):
+                current = 0.0
+
+        delta = self.gripper_step if direction > 0 else -self.gripper_step
+        target = max(grip_min, min(grip_max, current + delta))
+        self.set_gripper(target)
+        self.status_label.setText(
+            f"Gripper -> {target:.3f} (step {self.gripper_step:.3f})"
+        )
+        self.status_label.setStyleSheet("QLabel { color: blue; font-size: 10px; }")
+
+    def on_images_updated(self, head_rgb, wrist_rgb, depth_image, wrist_depth):
+        """Handle updated images from robot thread"""
+        import time
+        # print(time.ctime(), " >> I am called >> ", head_rgb is not None)
+        self.head_rgb = head_rgb.copy()
+        self.wrist_rgb = wrist_rgb.copy()
+        self.depth_image = depth_image.copy()
+        self.wrist_depth = wrist_depth.copy()
+        self._update_joint_state_table()
+        if self.is_recording_demo:
+            try:
+                self.demo_recorder.record_step(self._build_record_sample())
+            except Exception as e:
+                print(f"Recording step error: {e}")
+                self.stop_demo_recording()
+                self.status_label.setText(f"Recording stopped due error: {e}")
+                self.status_label.setStyleSheet("QLabel { color: red; font-size: 10px; }")
+        self.update_camera_displays()
+
+    def on_fps_updated(self, fps):
+        """Handle FPS updates"""
+        head_shape = self.head_rgb.shape if self.head_rgb is not None else 'N/A'
+        wrist_shape = self.wrist_rgb.shape if self.wrist_rgb is not None else 'N/A'
+        robot_status = "Ready" if self.ros_node.is_ready() else "Initializing..."
+        image_source = "bridge"
+        if hasattr(self.ros_node, "get_image_source"):
+            try:
+                image_source = str(self.ros_node.get_image_source())
+            except Exception:
+                image_source = "bridge"
+        status_color = "#27ae60" if self.ros_node.is_ready() else "#f39c12"
+        self.fps_label.setText(
+            f"FPS: {fps:.1f} | Robot: {robot_status} | ImageSrc: {image_source} | "
+            f"Head: {head_shape} | Wrist: {wrist_shape}"
+        )
+        self.fps_label.setStyleSheet(f"QLabel {{ padding: 5px; background-color: {status_color}; color: white; }}")
+
+    def update_camera_displays(self):
+        """Update camera display widgets"""
+        # Update Head RGB
+        # print(self.head_rgb.shape)
+        if self.head_rgb is not None:
+            head_display = self.head_rgb.copy()
+            # Apply mask overlay if available and using head camera for segmentation
+            if self.mask_overlay is not None and self.use_head_for_segmentation:
+                head_display = cv2.addWeighted(head_display, 0.7, self.mask_overlay, 0.3, 0)
+
+            # Draw 3D grasp axes and bounding box for debugging
+            if self._grasp_debug_info is not None and 'axis_pixels' in self._grasp_debug_info:
+                ap = self._grasp_debug_info['axis_pixels']
+                # Bounding rectangle corners — CYAN outline
+                if 'corners' in ap and len(ap['corners']) >= 3:
+                    corners = ap['corners']
+                    for i in range(len(corners)):
+                        cv2.line(head_display,
+                                 corners[i], corners[(i + 1) % len(corners)],
+                                 (255, 255, 0), 1, cv2.LINE_AA)
+                # Long axis — GREEN line
+                if 'long1' in ap and 'long2' in ap:
+                    cv2.line(head_display, ap['long1'], ap['long2'],
+                             (0, 255, 0), 2, cv2.LINE_AA)
+                # Narrow axis (grasp direction) — RED line
+                if 'narrow1' in ap and 'narrow2' in ap:
+                    cv2.line(head_display, ap['narrow1'], ap['narrow2'],
+                             (0, 0, 255), 2, cv2.LINE_AA)
+                # Center dot — YELLOW
+                if 'center' in ap:
+                    cv2.circle(head_display, ap['center'], 5, (0, 255, 255), -1)
+                # Labels
+                if 'long1' in ap:
+                    cv2.putText(head_display, "long", ap['long1'],
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                if 'narrow1' in ap:
+                    cv2.putText(head_display, "grasp", ap['narrow1'],
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+
+            # Draw manual region rectangles and selected grip-tip points (v8).
+            if self.manual_grasp_regions:
+                for region in self.manual_grasp_regions:
+                    rid = int(region.get("id", -1))
+                    x0, y0, x1, y1 = self._manual_region_rect_norm(region)
+                    is_sel = (self._manual_selected_region_id is not None and rid == int(self._manual_selected_region_id))
+                    rect_color = (0, 255, 255) if is_sel else (255, 0, 255)
+                    rect_thick = 2 if is_sel else 1
+                    cv2.rectangle(head_display, (x0, y0), (x1, y1), rect_color, rect_thick)
+                    cv2.putText(
+                        head_display,
+                        f"R{rid}",
+                        (x0, max(12, y0 - 4)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.45,
+                        rect_color,
+                        1,
+                        cv2.LINE_AA,
+                    )
+                    points = list(region.get("points", []))
+                    for i, p in enumerate(points, start=1):
+                        px, py = int(p[0]), int(p[1])
+                        p_color = (0, 255, 0) if i == 1 else (255, 200, 0)
+                        cv2.circle(head_display, (px, py), 4, p_color, -1)
+                        cv2.putText(
+                            head_display,
+                            f"P{i}",
+                            (px + 4, py - 4),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.4,
+                            p_color,
+                            1,
+                            cv2.LINE_AA,
+                        )
+
+            # Draw live drag rectangle while creating a new manual region.
+            if (
+                self._manual_draw_mode == "draw_rect"
+                and self._manual_dragging_rect
+                and self._manual_rect_start_px is not None
+                and self._manual_rect_live_px is not None
+            ):
+                x0, y0 = self._manual_rect_start_px
+                x1, y1 = self._manual_rect_live_px
+                cv2.rectangle(head_display, (int(x0), int(y0)), (int(x1), int(y1)), (0, 255, 255), 1)
+                cv2.putText(
+                    head_display,
+                    "drag region",
+                    (int(min(x0, x1)), int(max(12, min(y0, y1) - 4))),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.4,
+                    (0, 255, 255),
+                    1,
+                    cv2.LINE_AA,
+                )
+
+            head_pixmap = self.numpy_to_pixmap(head_display)
+            # Scale to fit container keeping aspect ratio, then size label to match
+            available = self.head_container.size()
+            scaled_pixmap = head_pixmap.scaled(
+                available,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation
+            )
+            self.head_display.setFixedSize(scaled_pixmap.size())
+            self.head_display.setPixmap(scaled_pixmap)
+
+        # Update Wrist RGB
+        if self.wrist_rgb is not None:
+            # First image received — expand container to full size
+            if not self._wrist_feed_active:
+                self._wrist_feed_active = True
+                self.wrist_container.setMaximumHeight(16777215)  # QWIDGETSIZE_MAX
+                self.wrist_container.setSizePolicy(
+                    QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+                self.wrist_label.setText("Gripper RGB Camera")
+                # Give it layout stretch comparable to head camera
+                layout = self.wrist_container.parentWidget().layout()
+                if layout is not None:
+                    idx = layout.indexOf(self.wrist_container)
+                    if idx >= 0:
+                        layout.setStretch(idx, 4)
+
+            wrist_display = self.wrist_rgb.copy()
+            wrist_pixmap = self.numpy_to_pixmap(wrist_display)
+            available = self.wrist_container.size()
+            scaled_pixmap = wrist_pixmap.scaled(
+                available,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation
+            )
+            self.wrist_display.setFixedSize(scaled_pixmap.size())
+            self.wrist_display.setPixmap(scaled_pixmap)
+
+    def numpy_to_pixmap(self, image):
+        """Convert numpy array to QPixmap"""
+        try:
+            # Ensure image is in correct format
+            if len(image.shape) == 2:
+                # Grayscale - convert to RGB
+                image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+            elif image.shape[2] == 4:
+                # RGBA - convert to RGB
+                image = cv2.cvtColor(image, cv2.COLOR_RGBA2RGB)
+
+            # Ensure uint8
+            if image.dtype != np.uint8:
+                image = (np.clip(image, 0, 255)).astype(np.uint8)
+
+            height, width, channel = image.shape
+            bytes_per_line = 3 * width
+
+            # Make sure data is contiguous
+            image = np.ascontiguousarray(image)
+
+            q_image = QImage(image.data, width, height, bytes_per_line, QImage.Format.Format_RGB888)
+            return QPixmap.fromImage(q_image)
+        except Exception as e:
+            print(f"Error converting image to pixmap: {e}")
+            # Return empty pixmap
+            return QPixmap()
+
+    def run_segmentation(self):
+        """Run SAM segmentation"""
+        # Use head camera for segmentation
+        rgb_for_seg = self.head_rgb if self.use_head_for_segmentation else self.wrist_rgb
+
+        if rgb_for_seg is None:
+            self.status_label.setText("No camera image available")
+            self.status_label.setStyleSheet("QLabel { color: red; }")
+            return
+
+        if self.seg_thread.isRunning():
+            print("Segmentation already running")
+            return
+
+        self.segment_button.setEnabled(False)
+        self.segment_button.setText("Segmenting...")
+        self.status_label.setText("Running SAM segmentation on GPU...")
+        self.status_label.setStyleSheet("QLabel { color: orange; font-size: 10px; }")
+
+        # Set images and start thread
+        self.seg_thread.set_images(rgb_for_seg.copy(), self.depth_image.copy())
+        self.seg_thread.start()
+
+    def on_model_loading(self):
+        """Handle model loading signal"""
+        self.status_label.setText("Loading SAM model on GPU...")
+        self.status_label.setStyleSheet("QLabel { color: blue; font-size: 10px; }")
+
+    def on_segmentation_complete(self, segments, mask_overlay):
+        """Handle segmentation completion"""
+        self.segments = segments
+        self.mask_overlay = mask_overlay
+        self._grasp_debug_info = None  # Clear old axis overlay
+
+        # Update object list
+        self.object_list.clear()
+        for i, seg in enumerate(segments):
+            color_hex = '#%02x%02x%02x' % seg['color']
+            label = f"Object {i+1} - Area: {seg['area']:.0f}px - Depth: {seg['depth']:.2f}m"
+            item = QListWidgetItem(label)
+            item.setBackground(QColor(color_hex))
+            item.setData(Qt.ItemDataRole.UserRole, i)
+            self.object_list.addItem(item)
+
+        self.status_label.setText(f"Found {len(segments)} objects")
+        self.status_label.setStyleSheet("QLabel { color: green; }")
+        self.segment_button.setEnabled(True)
+        self.segment_button.setText("Run SAM Segmentation")
+
+        # Update display
+        self.update_camera_displays()
+
+    def on_error(self, error_msg):
+        """Handle error messages"""
+        print(f"Error: {error_msg}")
+        self.status_label.setText(error_msg)
+        self.status_label.setStyleSheet("QLabel { color: red; }")
+        if not self.segment_button.isEnabled():
+            self.segment_button.setEnabled(True)
+            self.segment_button.setText("Run SAM Segmentation")
+
+    def on_object_selected(self, item):
+        """Handle object selection from list"""
+        idx = item.data(Qt.ItemDataRole.UserRole)
+        self.selected_segment = self.segments[idx]
+        self.center_button.setEnabled(True)
+        self.reach_button.setEnabled(True)
+        self.grasp_button.setEnabled(True)
+        print(f"Selected object {idx}: center={self.selected_segment['center']}, depth={self.selected_segment['depth']:.3f}m")
+
+    def _manual_region_by_id(self, region_id: int | None):
+        if region_id is None:
+            return None
+        for region in self.manual_grasp_regions:
+            if int(region.get("id", -1)) == int(region_id):
+                return region
+        return None
+
+    @staticmethod
+    def _manual_region_rect_norm(region: dict[str, Any]):
+        x0, y0, x1, y1 = [int(v) for v in region.get("rect", (0, 0, 0, 0))]
+        xa, xb = (x0, x1) if x0 <= x1 else (x1, x0)
+        ya, yb = (y0, y1) if y0 <= y1 else (y1, y0)
+        return xa, ya, xb, yb
+
+    def _manual_refresh_region_tree(self):
+        if not hasattr(self, "manual_region_tree"):
+            return
+        tree = self.manual_region_tree
+        tree.blockSignals(True)
+        tree.clear()
+        select_item = None
+        for region in self.manual_grasp_regions:
+            rid = int(region["id"])
+            x0, y0, x1, y1 = self._manual_region_rect_norm(region)
+            root = QTreeWidgetItem([f"R{rid}: ({x0},{y0}) -> ({x1},{y1})"])
+            root.setData(0, Qt.ItemDataRole.UserRole, rid)
+            points = list(region.get("points", []))
+            for i, p in enumerate(points, start=1):
+                child = QTreeWidgetItem([f"P{i}: ({int(p[0])},{int(p[1])})"])
+                child.setData(0, Qt.ItemDataRole.UserRole, rid)
+                root.addChild(child)
+            comp = region.get("computed")
+            if isinstance(comp, dict):
+                yaw_deg = np.degrees(float(comp.get("grasp_yaw", 0.0)))
+                grip = float(comp.get("gripper_width", 0.0))
+                c = QTreeWidgetItem([f"grasp: yaw={yaw_deg:.1f}deg, width={grip:.3f}"])
+                c.setData(0, Qt.ItemDataRole.UserRole, rid)
+                root.addChild(c)
+            tree.addTopLevelItem(root)
+            root.setExpanded(True)
+            if self._manual_selected_region_id is not None and rid == int(self._manual_selected_region_id):
+                select_item = root
+        tree.blockSignals(False)
+        if select_item is not None:
+            tree.setCurrentItem(select_item)
+
+    def _on_manual_region_tree_selection_changed(self):
+        if not hasattr(self, "manual_region_tree"):
+            return
+        item = self.manual_region_tree.currentItem()
+        if item is None:
+            self._manual_selected_region_id = None
+            self.update_camera_displays()
+            return
+        rid = item.data(0, Qt.ItemDataRole.UserRole)
+        if rid is None:
+            parent = item.parent()
+            rid = parent.data(0, Qt.ItemDataRole.UserRole) if parent is not None else None
+        self._manual_selected_region_id = int(rid) if rid is not None else None
+        self.update_camera_displays()
+
+    def _start_manual_region_draw(self):
+        if self.head_rgb is None:
+            self._set_status("Draw Region: no head image", "QLabel { color: red; }")
+            return
+        self._manual_draw_mode = "draw_rect"
+        self._manual_dragging_rect = False
+        self._manual_rect_start_px = None
+        self._manual_rect_live_px = None
+        self._set_status("Draw Region: drag left mouse on image to define rectangle", "QLabel { color: #1e88e5; font-size: 10px; }")
+
+    def _on_head_mouse_press(self, event):
+        if self.head_rgb is None:
+            return
+        if event.button() == Qt.MouseButton.LeftButton and self._manual_draw_mode == "draw_rect":
+            px, py = self._pixel_from_event(event)
+            if px is None:
+                return
+            self._manual_dragging_rect = True
+            self._manual_rect_start_px = (int(px), int(py))
+            self._manual_rect_live_px = (int(px), int(py))
+            self.update_camera_displays()
+            return
+        if event.button() == Qt.MouseButton.LeftButton and self._manual_draw_mode == "pick_points":
+            px, py = self._pixel_from_event(event)
+            if px is None:
+                return
+            region = self._manual_region_by_id(self._manual_selected_region_id)
+            if region is None:
+                self._set_status("Pick Points: select a region first", "QLabel { color: orange; }")
+                return
+            points = list(region.get("points", []))
+            if len(points) >= 2:
+                self._set_status("Region already has 2 points. Compute grasp or redraw.", "QLabel { color: orange; }")
+                return
+            points.append((int(px), int(py)))
+            region["points"] = points
+            region["computed"] = None
+            self._manual_refresh_region_tree()
+            self.update_camera_displays()
+            if len(points) < 2:
+                self._set_status("Pick second grip-tip point", "QLabel { color: #1e88e5; font-size: 10px; }")
+            else:
+                self._manual_draw_mode = None
+                self._set_status("2 points captured. Click Compute Grasp.", "QLabel { color: green; font-size: 10px; }")
+            return
+        self.on_image_click(event)
+
+    def _on_head_mouse_move(self, event):
+        if not self._manual_dragging_rect or self._manual_draw_mode != "draw_rect":
+            return
+        px, py = self._pixel_from_event(event)
+        if px is None:
+            return
+        self._manual_rect_live_px = (int(px), int(py))
+        self.update_camera_displays()
+
+    def _on_head_mouse_release(self, event):
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        if not self._manual_dragging_rect or self._manual_draw_mode != "draw_rect":
+            return
+        px, py = self._pixel_from_event(event)
+        if px is None:
+            self._manual_dragging_rect = False
+            self._manual_rect_start_px = None
+            self._manual_rect_live_px = None
+            return
+        self._manual_rect_live_px = (int(px), int(py))
+        x0, y0 = self._manual_rect_start_px if self._manual_rect_start_px is not None else (int(px), int(py))
+        x1, y1 = self._manual_rect_live_px
+        xa, xb = (x0, x1) if x0 <= x1 else (x1, x0)
+        ya, yb = (y0, y1) if y0 <= y1 else (y1, y0)
+        self._manual_dragging_rect = False
+        self._manual_rect_start_px = None
+        self._manual_rect_live_px = None
+        if abs(xb - xa) < 6 or abs(yb - ya) < 6:
+            self._set_status("Draw Region: rectangle too small", "QLabel { color: orange; }")
+            self.update_camera_displays()
+            return
+        rid = int(self._manual_region_next_id)
+        self._manual_region_next_id += 1
+        self.manual_grasp_regions.append(
+            {
+                "id": rid,
+                "rect": (int(xa), int(ya), int(xb), int(yb)),
+                "points": [],
+                "computed": None,
+            }
+        )
+        self._manual_selected_region_id = rid
+        self._manual_draw_mode = "pick_points"
+        self._manual_refresh_region_tree()
+        self.update_camera_displays()
+        self._set_status("Region created. Click 2 grip-tip points inside the box.", "QLabel { color: #1e88e5; font-size: 10px; }")
+
+    def _selected_manual_region(self):
+        region = self._manual_region_by_id(self._manual_selected_region_id)
+        if region is None and self.manual_grasp_regions:
+            region = self.manual_grasp_regions[-1]
+            self._manual_selected_region_id = int(region["id"])
+        return region
+
+    def _mask_from_manual_region(self, region):
+        if self.head_rgb is None:
+            return None
+        h, w = self.head_rgb.shape[:2]
+        mask = np.zeros((h, w), dtype=np.uint8)
+        x0, y0, x1, y1 = self._manual_region_rect_norm(region)
+        x0 = int(np.clip(x0, 0, w - 1))
+        x1 = int(np.clip(x1, 0, w - 1))
+        y0 = int(np.clip(y0, 0, h - 1))
+        y1 = int(np.clip(y1, 0, h - 1))
+        if x1 <= x0 or y1 <= y0:
+            return None
+        mask[y0:y1 + 1, x0:x1 + 1] = 1
+        return mask
+
+    def compute_selected_manual_region_grasp(self):
+        region = self._selected_manual_region()
+        if region is None:
+            self._set_status("Compute Grasp: no region selected", "QLabel { color: orange; }")
+            return
+        mask = self._mask_from_manual_region(region)
+        if mask is None:
+            self._set_status("Compute Grasp: invalid region mask", "QLabel { color: red; }")
+            return
+
+        x0, y0, x1, y1 = self._manual_region_rect_norm(region)
+        cx = int(round((x0 + x1) * 0.5))
+        cy = int(round((y0 + y1) * 0.5))
+        point_base, depth = self._get_3d_point_at_pixel(cx, cy)
+        if point_base is None or depth is None:
+            self._set_status("Compute Grasp: invalid depth at region center", "QLabel { color: red; }")
+            return
+
+        shape_info = self._analyze_segment_geometry(mask)
+        grasp_yaw, rect_info = self._compute_grasp_orientation(mask, cx, cy)
+
+        points = list(region.get("points", []))
+        gripper_width = None
+        if len(points) >= 2:
+            p1, p2 = points[0], points[1]
+            pb1, _ = self._get_3d_point_at_pixel(int(p1[0]), int(p1[1]))
+            pb2, _ = self._get_3d_point_at_pixel(int(p2[0]), int(p2[1]))
+            if pb1 is not None and pb2 is not None:
+                dx = float(pb2.point.x - pb1.point.x)
+                dy = float(pb2.point.y - pb1.point.y)
+                dz = float(pb2.point.z - pb1.point.z)
+                if np.hypot(dx, dy) > 1e-4:
+                    axis_angle = float(np.arctan2(dy, dx))
+                    grasp_yaw = self._resolve_wrist_yaw_candidate(axis_angle + float(np.pi / 2.0))
+                width_m = float(np.sqrt(dx * dx + dy * dy + dz * dz))
+                grip_aperture = float(width_m + 0.02)
+                gripper_width = float(
+                    np.clip(
+                        grip_aperture / 0.22,
+                        float(self.ros_node.JOINT_LIMITS[7][0]),
+                        float(self.ros_node.JOINT_LIMITS[7][1]),
+                    )
+                )
+
+        if gripper_width is None:
+            gripper_width = self._estimate_gripper_width(mask, cx, cy, depth, rect_info)
+
+        object_top_z = self._compute_object_top_z(mask)
+        if rect_info is not None and rect_info.get("top_z_max") is not None:
+            top_from_fit = float(rect_info["top_z_max"])
+            object_top_z = top_from_fit if object_top_z is None else max(float(object_top_z), top_from_fit)
+
+        region["computed"] = {
+            "target_base_xyz": [float(point_base.point.x), float(point_base.point.y), float(point_base.point.z)],
+            "grasp_yaw": float(grasp_yaw),
+            "gripper_width": float(gripper_width),
+            "object_top_z": None if object_top_z is None else float(object_top_z),
+            "shape_info": shape_info,
+            "rect_info": rect_info,
+        }
+        self._grasp_debug_info = rect_info
+        self._manual_refresh_region_tree()
+        self.update_camera_displays()
+        self._set_status(
+            f"Region grasp computed: yaw={np.degrees(float(grasp_yaw)):.1f}deg, grip={float(gripper_width):.3f}",
+            "QLabel { color: #1e88e5; font-size: 10px; }",
+        )
+
+    def align_gripper_to_selected_manual_region(self):
+        region = self._selected_manual_region()
+        if region is None or not isinstance(region.get("computed"), dict):
+            self._set_status("Align Gripper: compute grasp first", "QLabel { color: orange; }")
+            return
+        comp = region["computed"]
+        joint = self._current_manip_joint6()
+        if not (isinstance(joint, list) and len(joint) >= 6):
+            self._set_status("Align Gripper: current joint state unavailable", "QLabel { color: red; }")
+            return
+        joint = [float(v) for v in joint[:6]]
+        joint[3] = float(comp["grasp_yaw"])
+        joint[4] = float(np.deg2rad(GRASP_PITCH_DEG))
+        ok = self._execute_arm_to_chunked(joint[:6], gripper=None, timeout_s=6.0, reliable=False)
+        if ok:
+            self._set_status("Gripper aligned to computed orientation", "QLabel { color: green; font-size: 10px; }")
+        else:
+            self._set_status("Align Gripper failed", "QLabel { color: red; font-size: 10px; }")
+
+    def execute_selected_manual_region_grasp(self):
+        region = self._selected_manual_region()
+        if region is None or not isinstance(region.get("computed"), dict):
+            self._set_status("Execute Region Grasp: compute grasp first", "QLabel { color: orange; }")
+            return
+        if not self._begin_action('grasp'):
+            self._set_status("Another action is already running/paused", "QLabel { color: orange; font-size: 10px; }")
+            return
+
+        comp = region["computed"]
+        target_xyz = comp.get("target_base_xyz")
+        if not (isinstance(target_xyz, list) and len(target_xyz) >= 3):
+            self._set_action_state('idle')
+            self._set_status("Execute Region Grasp: invalid target xyz", "QLabel { color: red; }")
+            return
+
+        # Use the latest manual wrist orientation at execution time, so any
+        # user adjustments after Align Gripper are honored by IK planning.
+        exec_wrist_yaw = float(comp.get("grasp_yaw", 0.0))
+        exec_wrist_pitch = None
+        exec_wrist_roll = None
+        joint_now = self._current_manip_joint6()
+        if isinstance(joint_now, list) and len(joint_now) >= 6:
+            exec_wrist_yaw = float(joint_now[3])
+            exec_wrist_pitch = float(joint_now[4])
+            exec_wrist_roll = float(joint_now[5])
+
+        mask = self._mask_from_manual_region(region)
+        if mask is None:
+            self._set_action_state('idle')
+            self._set_status("Execute Region Grasp: invalid region mask", "QLabel { color: red; }")
+            return
+        self._grasp_debug_info = comp.get("rect_info")
+        self.update_camera_displays()
+
+        point_base = self._point_from_xyz(target_xyz)
+        gripper_width = float(comp.get("gripper_width", self.ros_node.JOINT_LIMITS[7][1]))
+        object_top_z = comp.get("object_top_z")
+        shape_info = comp.get("shape_info")
+
+        self._set_status(
+            "Executing manual region grasp (using current wrist orientation)...",
+            "QLabel { color: blue; font-size: 10px; }",
+        )
+
+        def run():
+            try:
+                self._execute_approach(
+                    point_base,
+                    mode='grasp',
+                    grasp_yaw=exec_wrist_yaw,
+                    gripper_width=gripper_width,
+                    object_top_z=object_top_z,
+                    grasp_mask=mask,
+                    long_axis_angle=None,
+                    wrist_pitch_target=exec_wrist_pitch,
+                    wrist_roll_target=exec_wrist_roll,
+                    grasp_shape_info=shape_info,
+                )
+            except Exception as e:
+                print(f"Manual region grasp error: {e}")
+                import traceback
+                traceback.print_exc()
+                self._set_status(f"Manual region grasp failed: {str(e)}", "QLabel { color: red; font-size: 10px; }")
+            finally:
+                with self._action_lock:
+                    st = self._action_state
+                if st == 'running':
+                    self._set_action_state('idle')
+
+        from threading import Thread
+        Thread(target=run, daemon=True).start()
+
+    def delete_selected_manual_region(self):
+        region = self._selected_manual_region()
+        if region is None:
+            self._set_status("Delete Region: no region selected", "QLabel { color: orange; }")
+            return
+        rid = int(region["id"])
+        self.manual_grasp_regions = [r for r in self.manual_grasp_regions if int(r.get("id", -1)) != rid]
+        if self._manual_selected_region_id == rid:
+            self._manual_selected_region_id = None
+        self._manual_draw_mode = None
+        self._manual_refresh_region_tree()
+        self.update_camera_displays()
+        self._set_status(f"Deleted region R{rid}", "QLabel { color: gray; font-size: 10px; }")
+
+    def on_image_click(self, event):
+        """Handle click on head RGB image — left-click selects segment, right-click shows context menu"""
+        if self.head_rgb is None:
+            return
+
+        # Get click position in image coordinates
+        px, py = self._pixel_from_event(event)
+        if px is None:
+            return
+
+        if event.button() == Qt.MouseButton.LeftButton:
+            # Left-click: select segment under cursor
+            if not self.segments:
+                return
+            for i, seg in enumerate(self.segments):
+                if py < seg['mask'].shape[0] and px < seg['mask'].shape[1]:
+                    if seg['mask'][py, px] > 0:
+                        self.object_list.setCurrentRow(i)
+                        self.selected_segment = seg
+                        self.center_button.setEnabled(True)
+                        self.reach_button.setEnabled(True)
+                        self.grasp_button.setEnabled(True)
+                        print(f"Clicked on object {i}")
+                        break
+
+        elif event.button() == Qt.MouseButton.RightButton:
+            # Right-click: show context menu with Center / Reach / Grasp
+            clicked_on_segment = False
+            if self.segments:
+                for i, seg in enumerate(self.segments):
+                    if py < seg['mask'].shape[0] and px < seg['mask'].shape[1]:
+                        if seg['mask'][py, px] > 0:
+                            clicked_on_segment = True
+                            clicked_segment = seg
+                            break
+
+            menu = QMenu(self)
+
+            center_action = QAction("Center", self)
+            center_action.triggered.connect(lambda: self._center_on_pixel(px, py))
+            menu.addAction(center_action)
+
+            reach_action = QAction("Reach", self)
+            reach_action.triggered.connect(lambda: self._reach_to_pixel(px, py))
+            menu.addAction(reach_action)
+
+            preview_grasp_action = QAction("See Grasp", self)
+            if clicked_on_segment:
+                preview_grasp_action.triggered.connect(
+                    lambda: self._preview_grasp_at_pixel(px, py, segment=clicked_segment)
+                )
+            else:
+                preview_grasp_action.setEnabled(False)
+            menu.addAction(preview_grasp_action)
+
+            grasp_action = QAction("Grasp", self)
+            if clicked_on_segment:
+                grasp_action.triggered.connect(lambda: self._grasp_at_pixel(px, py))
+            else:
+                grasp_action.setEnabled(False)
+            menu.addAction(grasp_action)
+
+            menu.addSeparator()
+
+            add_reach_goal_action = QAction("Add Reach Goal", self)
+            add_reach_goal_action.triggered.connect(lambda: self.add_reach_goal_at_pixel(px, py))
+            menu.addAction(add_reach_goal_action)
+
+            add_grasp_goal_action = QAction("Add Grasp Goal", self)
+            if clicked_on_segment:
+                add_grasp_goal_action.triggered.connect(
+                    lambda: self.add_grasp_goal_at_pixel(px, py, segment=clicked_segment)
+                )
+            else:
+                add_grasp_goal_action.setEnabled(False)
+            menu.addAction(add_grasp_goal_action)
+
+            menu.addSeparator()
+            draw_region_action = QAction("Draw Grasp Rectangle", self)
+            draw_region_action.triggered.connect(self._start_manual_region_draw)
+            menu.addAction(draw_region_action)
+
+            menu.exec(self.head_display.mapToGlobal(event.pos()))
+
+    def center_camera_on_object(self):
+        """Center camera on selected object"""
+        if self.selected_segment is None or self.head_rgb is None:
+            return
+
+        cx, cy = self.selected_segment['center']
+        img_height, img_width = self.head_rgb.shape[:2]
+
+        # Calculate offset
+        offset_x = (cx - img_width // 2) / img_width
+        offset_y = (cy - img_height // 2) / img_height
+
+        # Pan/tilt adjustment (small increments)
+        pan_adj = -offset_x * 0.2
+        tilt_adj = offset_y * 0.2
+
+        print(f"Centering camera: pan={pan_adj:.3f}, tilt={tilt_adj:.3f}")
+
+        # Apply adjustment incrementally
+        self.robot_controller.adjust_control('head_pan', pan_adj)
+        self.robot_controller.adjust_control('head_tilt', tilt_adj)
+
+        self.status_label.setText("Centering camera...")
+        self.status_label.setStyleSheet("QLabel { color: blue; }")
+
+    def grasp_object(self):
+        """Grasp selected object using orientation-aware approach (button handler)"""
+        if self.selected_segment is None or self.head_rgb is None:
+            self.status_label.setText("No object selected")
+            self.status_label.setStyleSheet("QLabel { color: red; }")
+            return
+
+        cx, cy = self.selected_segment['center']
+        self._grasp_at_pixel(cx, cy, segment=self.selected_segment)
+
+    def _get_3d_point_at_pixel(self, px, py):
+        """Convert a pixel (in rotated image coords) to a 3D point in base_link.
+        Returns (point_base, depth) or (None, None) on failure."""
+        if self.head_rgb is None or self.depth_image is None:
+            return None, None
+
+        h, w = self.depth_image.shape
+        if not (0 <= py < h and 0 <= px < w):
+            return None, None
+
+        # Average depth over a 5x5 window for robustness
+        y_min, y_max = max(0, py - 2), min(h, py + 3)
+        x_min, x_max = max(0, px - 2), min(w, px + 3)
+        region = self.depth_image[y_min:y_max, x_min:x_max]
+        valid = region[(region > 0.1) & (region < 5.0)]
+        if len(valid) == 0:
+            return None, None
+        depth = float(valid.mean())
+
+        point_camera = self.ros_node.pixel_to_3d_point(px, py, depth)
+        if point_camera is None:
+            return None, None
+
+        point_base = self.ros_node.transform_point_to_base(point_camera)
+        return point_base, depth
+
+    def _resolve_wrist_yaw_candidate(self, desired_yaw: float) -> float:
+        """Resolve desired wrist yaw with +/-pi-equivalent fallback inside joint limits."""
+        import math
+
+        desired = float(math.atan2(math.sin(float(desired_yaw)), math.cos(float(desired_yaw))))
+        wrist_lo, wrist_hi = float(self.ros_node.JOINT_LIMITS[2][0]), float(self.ros_node.JOINT_LIMITS[2][1])
+
+        current_wrist_yaw = 0.0
+        try:
+            q_now = self.ros_node.get_actual_qpos()
+            if isinstance(q_now, list) and len(q_now) > 2:
+                cand = float(q_now[2])
+                if math.isfinite(cand):
+                    current_wrist_yaw = cand
+        except Exception:
+            current_wrist_yaw = 0.0
+
+        candidates: list[float] = []
+        for k in range(-3, 4):
+            y = float(desired + float(k) * math.pi)
+            if wrist_lo <= y <= wrist_hi:
+                candidates.append(y)
+        if candidates:
+            return min(
+                candidates,
+                key=lambda y: abs(math.atan2(math.sin(y - current_wrist_yaw), math.cos(y - current_wrist_yaw))),
+            )
+        return float(np.clip(desired, wrist_lo, wrist_hi))
+
+    def _mask_to_base_points(self, mask, max_samples: int = 5000):
+        """Project mask pixels with valid depth into base_link point cloud."""
+        if self.depth_image is None or self.ros_node.camera_info is None or mask is None:
+            return None
+
+        mask_ys, mask_xs = np.where(mask > 0)
+        if len(mask_ys) < 30:
+            return None
+
+        if len(mask_ys) > int(max_samples):
+            step = int(np.ceil(len(mask_ys) / float(max_samples)))
+            mask_ys = mask_ys[::step]
+            mask_xs = mask_xs[::step]
+
+        depths = self.depth_image[mask_ys, mask_xs].astype(np.float64)
+        valid = (depths > 0.1) & (depths < 5.0)
+        if not np.any(valid):
+            return None
+        mask_ys = mask_ys[valid]
+        mask_xs = mask_xs[valid]
+        depths = depths[valid]
+
+        fx = self.ros_node.camera_info.k[0]
+        fy = self.ros_node.camera_info.k[4]
+        cx_cam = self.ros_node.camera_info.k[2]
+        cy_cam = self.ros_node.camera_info.k[5]
+        H_orig = self.ros_node.camera_info.height
+
+        try:
+            tf_msg = self.ros_node.tf_buffer.lookup_transform(
+                "base_link",
+                "camera_color_optical_frame",
+                rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=1.0),
+            )
+        except Exception:
+            return None
+
+        q = tf_msg.transform.rotation
+        R = np.array([
+            [1 - 2 * (q.y**2 + q.z**2), 2 * (q.x * q.y - q.z * q.w), 2 * (q.x * q.z + q.y * q.w)],
+            [2 * (q.x * q.y + q.z * q.w), 1 - 2 * (q.x**2 + q.z**2), 2 * (q.y * q.z - q.x * q.w)],
+            [2 * (q.x * q.z - q.y * q.w), 2 * (q.y * q.z + q.x * q.w), 1 - 2 * (q.x**2 + q.y**2)],
+        ])
+        t_vec = np.array(
+            [
+                tf_msg.transform.translation.x,
+                tf_msg.transform.translation.y,
+                tf_msg.transform.translation.z,
+            ]
+        )
+
+        rotated_head = bool(getattr(self.ros_node, "head_image_rotated_90_cw", lambda: STRETCH_AI_ROTATE_HEAD_90_CW)())
+        if rotated_head:
+            orig_col = mask_ys.astype(np.float64)
+            orig_row = (H_orig - 1 - mask_xs).astype(np.float64)
+        else:
+            orig_col = mask_xs.astype(np.float64)
+            orig_row = mask_ys.astype(np.float64)
+
+        cam_x = (orig_col - cx_cam) * depths / fx
+        cam_y = (orig_row - cy_cam) * depths / fy
+        cam_z = depths
+        cam_pts = np.stack([cam_x, cam_y, cam_z], axis=1)
+        base_pts = (R @ cam_pts.T).T + t_vec
+        if len(base_pts) < 20:
+            return None
+        return base_pts
+
+    def _analyze_segment_geometry(self, mask):
+        """Analyze visible 3D surface geometry and choose grasp approach strategy."""
+        import math
+
+        base_pts = self._mask_to_base_points(mask, max_samples=5000)
+        if base_pts is None or len(base_pts) < 30:
+            return None
+
+        pts = np.asarray(base_pts, dtype=np.float64).reshape(-1, 3)
+        centroid = pts.mean(axis=0)
+        centered = pts - centroid
+        cov = (centered.T @ centered) / max(1, len(centered) - 1)
+        eigvals, eigvecs = np.linalg.eigh(cov)  # ascending
+        order = np.argsort(eigvals)[::-1]
+        eigvals = eigvals[order]
+        eigvecs = eigvecs[:, order]
+
+        axis_major = eigvecs[:, 0]
+        axis_mid = eigvecs[:, 1]
+        axis_minor = eigvecs[:, 2]  # approx visible-surface normal
+        if axis_minor[2] < 0.0:
+            axis_minor = -axis_minor
+
+        proj_major = centered @ axis_major
+        proj_mid = centered @ axis_mid
+        proj_minor = centered @ axis_minor
+        span_major = float(np.quantile(proj_major, 0.95) - np.quantile(proj_major, 0.05))
+        span_mid = float(np.quantile(proj_mid, 0.95) - np.quantile(proj_mid, 0.05))
+        span_minor = float(np.quantile(proj_minor, 0.95) - np.quantile(proj_minor, 0.05))
+
+        z_vals = pts[:, 2]
+        z_span = float(np.quantile(z_vals, 0.95) - np.quantile(z_vals, 0.05))
+        xy = pts[:, :2]
+        x_span = float(np.quantile(xy[:, 0], 0.95) - np.quantile(xy[:, 0], 0.05))
+        y_span = float(np.quantile(xy[:, 1], 0.95) - np.quantile(xy[:, 1], 0.05))
+        xy_span = float(np.hypot(x_span, y_span))
+
+        normal_z_abs = float(abs(axis_minor[2]))
+        is_vertical_face = normal_z_abs <= float(VERTICAL_SURFACE_NORMAL_Z_MAX)
+        is_horizontal_top = normal_z_abs >= float(HORIZONTAL_SURFACE_NORMAL_Z_MIN)
+        is_tall_slender = (z_span >= float(VERTICAL_OBJECT_HEIGHT_MIN_M)) and (xy_span <= float(VERTICAL_OBJECT_XY_SPAN_MAX_M))
+
+        if is_vertical_face or is_tall_slender:
+            geometry_class = "vertical_like"
+            approach_strategy = "reach_standoff"
+        elif is_horizontal_top:
+            geometry_class = "horizontal_top_like"
+            approach_strategy = "lift_standoff"
+        else:
+            geometry_class = "mixed_surface"
+            approach_strategy = "lift_standoff"
+
+        # Use the most horizontal principal axis among (major, mid) for yaw inference.
+        horiz_major = float(np.linalg.norm(axis_major[:2]))
+        horiz_mid = float(np.linalg.norm(axis_mid[:2]))
+        axis_for_yaw = axis_major if horiz_major >= horiz_mid else axis_mid
+        axis_xy_norm = float(np.linalg.norm(axis_for_yaw[:2]))
+        if axis_xy_norm > 1e-6:
+            axis_angle_xy = float(math.atan2(float(axis_for_yaw[1]), float(axis_for_yaw[0])))
+        else:
+            axis_angle_xy = None
+
+        info = {
+            "ok": True,
+            "centroid": [float(v) for v in centroid.tolist()],
+            "axis_major": [float(v) for v in axis_major.tolist()],
+            "axis_mid": [float(v) for v in axis_mid.tolist()],
+            "axis_minor": [float(v) for v in axis_minor.tolist()],
+            "span_major": span_major,
+            "span_mid": span_mid,
+            "span_minor": span_minor,
+            "z_span": z_span,
+            "xy_span": xy_span,
+            "normal_z_abs": normal_z_abs,
+            "is_vertical_face": bool(is_vertical_face),
+            "is_horizontal_top": bool(is_horizontal_top),
+            "is_tall_slender": bool(is_tall_slender),
+            "geometry_class": geometry_class,
+            "approach_strategy": approach_strategy,
+            "axis_angle_xy_rad": axis_angle_xy,
+        }
+
+        print(
+            "[geometry] "
+            f"class={geometry_class} strategy={approach_strategy} "
+            f"normal|z|={normal_z_abs:.3f} z_span={z_span:.3f} xy_span={xy_span:.3f} "
+            f"span_major={span_major:.3f} span_mid={span_mid:.3f} span_minor={span_minor:.3f}"
+        )
+        return info
+
+    @staticmethod
+    def _compute_gripper_reach_drop(wrist_yaw=0.0, wrist_pitch=0.0, wrist_roll=0.0):
+        """Compute effective horizontal reach and vertical drop of the grasp
+        center relative to the arm extension axis (link_arm_l0 end), given
+        the current wrist joint angles.
+
+        The kinematic chain (from URDF, Stretch SE3 with SG3 gripper):
+          link_arm_l0
+            -> joint_wrist_yaw  (revolute, Z-axis)
+               offset from arm end: x=0.083, y=-0.031
+            -> joint_wrist_pitch (revolute)
+               offset: y=0.019, z=-0.031
+            -> joint_wrist_roll  (revolute)
+               offset: x=-0.019, y=-0.024, z=0.020
+            -> gripper body  (fixed)
+               offset: z=0.021
+            -> grasp center  (fixed)
+               offset: z=0.230
+
+        For our grasp planning we care about two numbers in the
+        arm-aligned frame AFTER base rotation has aligned the arm
+        with the object:
+          - reach: how far the grasp center extends along the arm
+                   extension direction (-Y in base_link before rotation,
+                   i.e. outward from the robot)
+          - drop:  how far the grasp center hangs below the lift height
+
+        At the default home pose (yaw=0, pitch=0, roll=0) the gripper
+        points straight down (-Z in base_link), so:
+          reach ≈ 0.083m (wrist yaw origin offset)
+          drop  ≈ 0.031 + 0.031 + 0.024 + 0.021 + 0.230 ≈ 0.337m
+        But empirical observation shows the Stretch gripper in home pose
+        has a smaller effective drop (~0.20-0.25m) because the joints
+        have non-trivial rpy that fold the chain differently.
+
+        We use a simplified planar model:
+          - The gripper has a fixed 'stalk' of length L from the wrist
+            pitch axis to the grasp center.
+          - wrist_pitch rotates this stalk: pitch=0 means pointing down,
+            positive pitch tilts the stalk forward (toward -Y / outward).
+          - wrist_yaw rotates the horizontal projection: yaw=0 means
+            the stalk swings in the arm plane.
+
+        Returns (reach_m, drop_m, lateral_m).
+        """
+        import math
+
+        # Distances from URDF (meters)
+        WRIST_YAW_OFFSET_FORWARD = 0.083   # arm end to wrist_yaw along arm (-Y)
+        WRIST_YAW_OFFSET_RIGHT = 0.031     # lateral offset
+
+        # Combined stalk length from wrist_pitch axis to grasp center
+        # (pitch->roll->gripper_body->grasp_center, summing along the
+        # direction that becomes "down" or "forward" depending on pitch)
+        # Keep analytical fallback consistent with grasp reverse-geometry.
+        STALK_LENGTH = GRASP_STALK_LENGTH_M
+        PITCH_AXIS_DROP = 0.031  # drop from wrist_yaw to wrist_pitch axis
+
+        # At pitch=0 the stalk points downward (−Z).
+        # On Stretch, negative wrist_pitch tilts forward/outward.
+        stalk_forward = -STALK_LENGTH * math.sin(wrist_pitch)  # horizontal (outward)
+        stalk_down = STALK_LENGTH * math.cos(wrist_pitch)     # vertical (downward)
+
+        # Wrist yaw rotates the horizontal component.
+        # yaw=0 means directly along the arm axis.
+        # The forward component projects onto the arm direction by cos(yaw).
+        reach_from_stalk = stalk_forward * math.cos(wrist_yaw)
+
+        # Lateral: perpendicular to arm axis in horizontal plane.
+        # On Stretch, negative yaw swings the gripper tip toward +X (left
+        # of arm when facing outward). This is opposite to the standard
+        # sin(yaw) direction, so we negate it.
+        lateral_from_stalk = stalk_forward * math.sin(wrist_yaw)
+        lateral = WRIST_YAW_OFFSET_RIGHT - lateral_from_stalk
+
+        # Total horizontal reach along arm direction
+        reach = WRIST_YAW_OFFSET_FORWARD + reach_from_stalk
+
+        # Total vertical drop
+        drop = PITCH_AXIS_DROP + stalk_down
+
+        return reach, drop, lateral
+
+    def _lookup_gripper_offset_from_arm(self):
+        """Look up the actual 3D offset from arm end (link_arm_l0) to
+        gripper tip (link_grasp_center) using the live TF tree.
+
+        link_arm_l0 is the outermost telescoping link — it moves with arm
+        extension.  So the returned offset is purely the mechanical gripper
+        displacement and does NOT include arm extension.
+
+        Returns dict with:
+            reach   – distance along arm axis (-Y in base_link), positive = outward
+            lateral – offset perpendicular to arm axis in horizontal plane,
+                      positive = toward +X (robot forward)
+            drop    – distance below arm end, positive = below
+        Or None if TF lookup fails.
+        """
+        # Try link_grasp_center first, then fall back to gripper body
+        grasp_frame = None
+        for candidate in ('link_grasp_center', 'link_gripper_s3_body'):
+            try:
+                self.ros_node.tf_buffer.lookup_transform(
+                    'base_link', candidate,
+                    rclpy.time.Time(),
+                    timeout=rclpy.duration.Duration(seconds=0.5))
+                grasp_frame = candidate
+                break
+            except Exception:
+                continue
+
+        if grasp_frame is None:
+            print("  WARNING: Could not find gripper TF frame "
+                  "(tried link_grasp_center, link_gripper_s3_body)")
+            return None
+
+        try:
+            gc_tf = self.ros_node.tf_buffer.lookup_transform(
+                'base_link', grasp_frame,
+                rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=2.0))
+            arm_tf = self.ros_node.tf_buffer.lookup_transform(
+                'base_link', 'link_arm_l0',
+                rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=2.0))
+
+            dx = gc_tf.transform.translation.x - arm_tf.transform.translation.x
+            dy = gc_tf.transform.translation.y - arm_tf.transform.translation.y
+            dz = gc_tf.transform.translation.z - arm_tf.transform.translation.z
+
+            # Arm extends along -Y in base_link.
+            # dy is negative when gripper extends outward (-Y).
+            reach = -dy       # positive = extending outward along arm axis
+            lateral = dx      # positive = toward robot front (+X)
+            drop = -dz        # positive = below arm level
+
+            print(f"  TF gripper offset ({grasp_frame}): "
+                  f"reach={reach*100:.1f}cm, lateral={lateral*100:.1f}cm, "
+                  f"drop={drop*100:.1f}cm")
+            print(f"    (raw dx={dx:.4f}, dy={dy:.4f}, dz={dz:.4f})")
+
+            return {'reach': reach, 'lateral': lateral, 'drop': drop}
+
+        except Exception as e:
+            print(f"  WARNING: TF gripper lookup failed: {e}")
+            return None
+
+    def _compute_object_top_z(self, mask, padding_px=40):
+        """Compute the maximum Z in base_link of the object and nearby region.
+
+        Scans the SAM mask *and* a padded bounding-box around it to detect
+        nearby tall obstacles the gripper must clear during approach.
+
+        Uses vectorised numpy + a single TF lookup for speed.
+
+        Returns the maximum Z coordinate (metres, in base_link), or None.
+        """
+        if self.depth_image is None or mask is None:
+            return None
+        if self.ros_node.camera_info is None:
+            return None
+
+        # Camera intrinsics
+        fx = self.ros_node.camera_info.k[0]
+        fy = self.ros_node.camera_info.k[4]
+        cx_cam = self.ros_node.camera_info.k[2]
+        cy_cam = self.ros_node.camera_info.k[5]
+        H_orig = self.ros_node.camera_info.height
+
+        # Camera → base_link transform (look up once)
+        try:
+            tf_msg = self.ros_node.tf_buffer.lookup_transform(
+                'base_link', 'camera_color_optical_frame',
+                rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=1.0))
+        except Exception as e:
+            print(f"  WARNING: Cannot compute object height: {e}")
+            return None
+
+        q = tf_msg.transform.rotation
+        R = np.array([
+            [1 - 2*(q.y**2 + q.z**2), 2*(q.x*q.y - q.z*q.w), 2*(q.x*q.z + q.y*q.w)],
+            [2*(q.x*q.y + q.z*q.w), 1 - 2*(q.x**2 + q.z**2), 2*(q.y*q.z - q.x*q.w)],
+            [2*(q.x*q.z - q.y*q.w), 2*(q.y*q.z + q.x*q.w), 1 - 2*(q.x**2 + q.y**2)]
+        ])
+        t_vec = np.array([tf_msg.transform.translation.x,
+                          tf_msg.transform.translation.y,
+                          tf_msg.transform.translation.z])
+
+        # Padded bounding box of the mask
+        mask_ys, mask_xs = np.where(mask > 0)
+        if len(mask_ys) == 0:
+            return None
+
+        h, w = self.depth_image.shape
+        y_min = max(0, int(mask_ys.min()) - padding_px)
+        y_max = min(h - 1, int(mask_ys.max()) + padding_px)
+        x_min = max(0, int(mask_xs.min()) - padding_px)
+        x_max = min(w - 1, int(mask_xs.max()) + padding_px)
+
+        # Sample a grid inside the padded box (~20 steps per axis)
+        stride = max(1, max(y_max - y_min, x_max - x_min) // 20)
+        ys = np.arange(y_min, y_max + 1, stride)
+        xs = np.arange(x_min, x_max + 1, stride)
+        grid_ys, grid_xs = np.meshgrid(ys, xs, indexing='ij')
+        grid_ys = grid_ys.ravel()
+        grid_xs = grid_xs.ravel()
+
+        # Depths at sampled points
+        depths = self.depth_image[grid_ys, grid_xs].astype(np.float64)
+        valid = (depths > 0.1) & (depths < 5.0)
+        if not np.any(valid):
+            return None
+
+        grid_ys = grid_ys[valid]
+        grid_xs = grid_xs[valid]
+        depths = depths[valid]
+
+        rotated_head = bool(getattr(self.ros_node, "head_image_rotated_90_cw", lambda: STRETCH_AI_ROTATE_HEAD_90_CW)())
+        # Map display pixels back to camera pixels.
+        if rotated_head:
+            # Display is 90deg CW-rotated relative to camera frame.
+            orig_col = grid_ys.astype(np.float64)
+            orig_row = (H_orig - 1 - grid_xs).astype(np.float64)
+        else:
+            # Display matches camera frame orientation.
+            orig_col = grid_xs.astype(np.float64)
+            orig_row = grid_ys.astype(np.float64)
+
+        # Pinhole → 3D in camera optical frame (vectorised)
+        cam_x = (orig_col - cx_cam) * depths / fx
+        cam_y = (orig_row - cy_cam) * depths / fy
+        cam_z = depths
+
+        # Transform all points to base_link in one shot
+        cam_pts = np.stack([cam_x, cam_y, cam_z], axis=1)  # (N, 3)
+        base_pts = (R @ cam_pts.T).T + t_vec                # (N, 3)
+
+        max_z = float(base_pts[:, 2].max())
+        print(f"  Object/region max height: {max_z:.3f}m "
+              f"(scanned {len(depths)} points in {y_max-y_min}x{x_max-x_min}px region)")
+
+        return max_z
+
+    def _compute_grasp_orientation(self, mask, px, py):
+        """Compute robust grasp orientation from a 3D top-surface rectangle.
+
+        Pipeline:
+          1) Sample mask pixels with valid depth and project to base_link.
+          2) Keep only top-surface points (near max Z) to avoid tall side walls.
+          3) Fit an oriented rectangle in XY using PCA extents.
+          4) Force all rectangle corners onto one plane (mean top-surface Z).
+
+        This gives a stable rectangle even for irregular tops and perspective.
+        Returns (grasp_angle_rad, rect_info_dict) or (0.0, None) on failure.
+        """
+        import math
+
+        if self.depth_image is None or self.ros_node.camera_info is None or mask is None:
+            return 0.0, None
+
+        mask_ys, mask_xs = np.where(mask > 0)
+        if len(mask_ys) < 50:
+            return 0.0, None
+
+        # Subsample for speed while keeping coverage
+        max_samples = 3000
+        if len(mask_ys) > max_samples:
+            step = int(np.ceil(len(mask_ys) / max_samples))
+            mask_ys = mask_ys[::step]
+            mask_xs = mask_xs[::step]
+
+        # Camera intrinsics
+        fx = self.ros_node.camera_info.k[0]
+        fy = self.ros_node.camera_info.k[4]
+        cx_cam = self.ros_node.camera_info.k[2]
+        cy_cam = self.ros_node.camera_info.k[5]
+        H_orig = self.ros_node.camera_info.height
+
+        # Camera -> base transform (single lookup)
+        try:
+            tf_msg = self.ros_node.tf_buffer.lookup_transform(
+                'base_link', 'camera_color_optical_frame',
+                rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=1.0))
+        except Exception as e:
+            print(f"  WARNING: Cannot get camera→base TF for grasp orientation: {e}")
+            return 0.0, None
+
+        q = tf_msg.transform.rotation
+        R = np.array([
+            [1 - 2*(q.y**2 + q.z**2), 2*(q.x*q.y - q.z*q.w), 2*(q.x*q.z + q.y*q.w)],
+            [2*(q.x*q.y + q.z*q.w), 1 - 2*(q.x**2 + q.z**2), 2*(q.y*q.z - q.x*q.w)],
+            [2*(q.x*q.z - q.y*q.w), 2*(q.y*q.z + q.x*q.w), 1 - 2*(q.x**2 + q.y**2)]
+        ])
+        t_vec = np.array([tf_msg.transform.translation.x,
+                          tf_msg.transform.translation.y,
+                          tf_msg.transform.translation.z])
+
+        # Depth samples on mask
+        depths = self.depth_image[mask_ys, mask_xs].astype(np.float64)
+        valid = (depths > 0.1) & (depths < 5.0)
+        if not np.any(valid):
+            return 0.0, None
+        mask_ys = mask_ys[valid]
+        mask_xs = mask_xs[valid]
+        depths = depths[valid]
+
+        rotated_head = bool(getattr(self.ros_node, "head_image_rotated_90_cw", lambda: STRETCH_AI_ROTATE_HEAD_90_CW)())
+        # Map display pixels back to camera image coordinates.
+        if rotated_head:
+            orig_col = mask_ys.astype(np.float64)
+            orig_row = (H_orig - 1 - mask_xs).astype(np.float64)
+        else:
+            orig_col = mask_xs.astype(np.float64)
+            orig_row = mask_ys.astype(np.float64)
+
+        # Pinhole -> camera frame -> base_link (vectorized)
+        cam_x = (orig_col - cx_cam) * depths / fx
+        cam_y = (orig_row - cy_cam) * depths / fy
+        cam_z = depths
+        cam_pts = np.stack([cam_x, cam_y, cam_z], axis=1)
+        base_pts = (R @ cam_pts.T).T + t_vec
+
+        if len(base_pts) < 30:
+            return 0.0, None
+
+        # Top-surface extraction (avoid sides of tall objects)
+        z_vals = base_pts[:, 2]
+        z_max = float(z_vals.max())
+        z_min = float(z_vals.min())
+        z_span = max(0.0, z_max - z_min)
+        top_band = min(0.05, max(0.015, 0.20 * z_span))  # 1.5cm .. 5cm
+        top_sel = z_vals >= (z_max - top_band)
+        top_pts = base_pts[top_sel]
+        if len(top_pts) < 20:
+            # Fallback: use top quartile by Z
+            z_q = np.quantile(z_vals, 0.75)
+            top_pts = base_pts[z_vals >= z_q]
+        if len(top_pts) < 10:
+            print("  WARNING: Not enough top-surface points for rectangle fit")
+            return 0.0, None
+
+        xy = top_pts[:, :2]
+        mean_xy = xy.mean(axis=0)
+        centered = xy - mean_xy
+
+        # PCA in XY for robust oriented rectangle
+        cov = (centered.T @ centered) / max(1, len(centered) - 1)
+        eigvals, eigvecs = np.linalg.eigh(cov)  # ascending
+        order = np.argsort(eigvals)[::-1]
+        u = eigvecs[:, order[0]]  # long-axis direction
+        v = eigvecs[:, order[1]]  # narrow-axis direction
+
+        proj_u = centered @ u
+        proj_v = centered @ v
+        u_min, u_max = float(proj_u.min()), float(proj_u.max())
+        v_min, v_max = float(proj_v.min()), float(proj_v.max())
+        long_len = u_max - u_min
+        narrow_len = v_max - v_min
+
+        if long_len < 1e-6:
+            print("  WARNING: Long-axis projection too small for stable orientation")
+            return 0.0, None
+
+        # Ensure robust rectangle: if degenerate/triangle-like, thicken narrow side.
+        min_aspect = 0.30
+        if narrow_len < min_aspect * long_len:
+            v_mid = 0.5 * (v_min + v_max)
+            narrow_len = min_aspect * long_len
+            v_min = v_mid - 0.5 * narrow_len
+            v_max = v_mid + 0.5 * narrow_len
+            print(f"  NOTE: Expanded narrow side to avoid degenerate rectangle "
+                  f"(aspect<{min_aspect:.2f})")
+
+        # Rectangle corners in XY (always a proper rectangle)
+        corners_xy = np.array([
+            mean_xy + u * u_max + v * v_max,
+            mean_xy + u * u_max + v * v_min,
+            mean_xy + u * u_min + v * v_min,
+            mean_xy + u * u_min + v * v_max,
+        ], dtype=np.float64)
+
+        # Put all corners on one plane (mean top-surface height)
+        z_plane = float(top_pts[:, 2].mean())
+        corners_3d = np.column_stack([corners_xy, np.full(4, z_plane)])
+        centroid_3d = np.array([mean_xy[0], mean_xy[1], z_plane], dtype=np.float64)
+        centroid_xy = centroid_3d[:2]
+
+        # Angle of long axis in base_link XY
+        long_axis_angle = math.atan2(u[1], u[0])
+
+        # Grasp yaw relative to arm direction (-Y), with wrist-limit-aware
+        # equivalent-angle fallback (yaw and yaw +/- pi are equivalent for
+        # parallel-jaw grasp alignment).
+        desired_yaw = long_axis_angle + math.pi / 2.0
+        desired_yaw = math.atan2(math.sin(desired_yaw), math.cos(desired_yaw))
+        wrist_lo, wrist_hi = float(self.ros_node.JOINT_LIMITS[2][0]), float(self.ros_node.JOINT_LIMITS[2][1])
+
+        current_wrist_yaw = 0.0
+        try:
+            q_now = self.ros_node.get_actual_qpos()
+            if isinstance(q_now, list) and len(q_now) > 2:
+                wrist_yaw_now = float(q_now[2])
+                if math.isfinite(wrist_yaw_now):
+                    current_wrist_yaw = wrist_yaw_now
+        except Exception:
+            current_wrist_yaw = 0.0
+
+        # Build equivalent candidates separated by pi and keep only feasible ones.
+        candidates: list[float] = []
+        for k in range(-3, 4):
+            y = float(desired_yaw + float(k) * math.pi)
+            if wrist_lo <= y <= wrist_hi:
+                candidates.append(y)
+
+        used_equivalent_fallback = False
+        used_hard_clip = False
+        if candidates:
+            # Prefer smallest motion from current wrist yaw for smoother execution.
+            grasp_yaw = min(
+                candidates,
+                key=lambda y: abs(math.atan2(math.sin(y - current_wrist_yaw), math.cos(y - current_wrist_yaw))),
+            )
+            if (desired_yaw < wrist_lo) or (desired_yaw > wrist_hi):
+                used_equivalent_fallback = True
+        else:
+            # If no equivalent representation fits, hard-clip as last resort.
+            grasp_yaw = float(np.clip(desired_yaw, wrist_lo, wrist_hi))
+            used_hard_clip = True
+
+        # Axis endpoints for debug overlay
+        long_dir = u / (np.linalg.norm(u) + 1e-9)
+        narrow_dir = v / (np.linalg.norm(v) + 1e-9)
+        long_end1 = np.array([centroid_xy[0] + long_dir[0] * long_len * 0.5,
+                              centroid_xy[1] + long_dir[1] * long_len * 0.5,
+                              z_plane], dtype=np.float64)
+        long_end2 = np.array([centroid_xy[0] - long_dir[0] * long_len * 0.5,
+                              centroid_xy[1] - long_dir[1] * long_len * 0.5,
+                              z_plane], dtype=np.float64)
+        narrow_end1 = np.array([centroid_xy[0] + narrow_dir[0] * narrow_len * 0.5,
+                                centroid_xy[1] + narrow_dir[1] * narrow_len * 0.5,
+                                z_plane], dtype=np.float64)
+        narrow_end2 = np.array([centroid_xy[0] - narrow_dir[0] * narrow_len * 0.5,
+                                centroid_xy[1] - narrow_dir[1] * narrow_len * 0.5,
+                                z_plane], dtype=np.float64)
+
+        # Reverse transform for overlay projection
+        R_inv = R.T
+        t_inv = -R_inv @ t_vec
+
+        def base_to_image_pixel(pt_base):
+            cam_pt = R_inv @ pt_base + t_inv
+            if cam_pt[2] <= 0:
+                return None
+            orig_col = cam_pt[0] * fx / cam_pt[2] + cx_cam
+            orig_row = cam_pt[1] * fy / cam_pt[2] + cy_cam
+            if rotated_head:
+                rot_px = int(H_orig - 1 - orig_row)
+                rot_py = int(orig_col)
+            else:
+                rot_px = int(orig_col)
+                rot_py = int(orig_row)
+            return (rot_px, rot_py)
+
+        axis_pixels = {}
+        for name, pt in [('center', centroid_3d),
+                         ('long1', long_end1), ('long2', long_end2),
+                         ('narrow1', narrow_end1), ('narrow2', narrow_end2)]:
+            pix = base_to_image_pixel(pt)
+            if pix is not None:
+                axis_pixels[name] = pix
+
+        corner_pixels = []
+        for corner in corners_3d:
+            pix = base_to_image_pixel(corner)
+            if pix is not None:
+                corner_pixels.append((int(pix[0]), int(pix[1])))
+        axis_pixels['corners'] = corner_pixels
+
+        rect_info = {
+            'center': (float(centroid_xy[0]), float(centroid_xy[1])),
+            'size': (float(narrow_len), float(long_len)),  # (narrow, long) in metres
+            'metric': True,
+            'long_axis_angle_deg': math.degrees(long_axis_angle),
+            'grasp_angle_deg': math.degrees(grasp_yaw),
+            'axis_pixels': axis_pixels,
+            'plane_z': z_plane,
+            'top_z_max': z_max,
+        }
+
+        print("  3D grasp orientation (top-surface planar rectangle):")
+        print(f"    Top points: {len(top_pts)}/{len(base_pts)} (z_max={z_max:.3f}, band={top_band:.3f})")
+        print(f"    Long side: {math.degrees(long_axis_angle):.1f}° from +X, length={long_len*100:.1f}cm")
+        print(f"    Narrow side: length={narrow_len*100:.1f}cm, plane_z={z_plane:.3f}m")
+        print(f"    Grasp yaw: {math.degrees(grasp_yaw):.1f}° (wrist_yaw={grasp_yaw:.3f} rad)")
+        if used_equivalent_fallback:
+            print(
+                "    NOTE: desired yaw was outside wrist limits; using equivalent +/-180deg yaw "
+                f"within [{wrist_lo:.3f}, {wrist_hi:.3f}]"
+            )
+        elif used_hard_clip:
+            print(
+                "    WARNING: no equivalent yaw was inside wrist limits; hard-clipped to "
+                f"[{wrist_lo:.3f}, {wrist_hi:.3f}]"
+            )
+
+        return grasp_yaw, rect_info
+
+    def _estimate_gripper_width(self, mask, px, py, depth, rect_info=None):
+        """Estimate how wide the gripper should open based on object width at grasp point.
+
+        Uses the SAM mask's narrow dimension (from minAreaRect) and the depth
+        to convert from pixels to meters.
+
+        Returns gripper aperture in meters, clamped to joint limits.
+        """
+        if self.ros_node.camera_info is None:
+            return 0.5  # fallback: fully open
+
+        # Get focal length for pixel-to-meter conversion
+        fx = self.ros_node.camera_info.k[0]
+
+        # Use rect narrow dimension if available
+        if rect_info is not None and rect_info.get('metric'):
+            # 3D PCA rect_info — size is already in metres
+            object_width_m = rect_info['size'][0]
+        elif rect_info is not None:
+            # Legacy 2D rect_info — narrow dimension in pixels
+            narrow_px = rect_info['size'][0]
+            object_width_m = narrow_px * depth / fx
+        else:
+            # Fallback: measure mask width at the grasp row
+            row = min(py, mask.shape[0] - 1)
+            row_pixels = np.where(mask[row] > 0)[0]
+            if len(row_pixels) > 0:
+                narrow_px = row_pixels[-1] - row_pixels[0]
+                object_width_m = narrow_px * depth / fx
+            else:
+                return 0.5  # fallback
+
+        # Add a small margin (1cm each side) for clearance
+        gripper_aperture = object_width_m + 0.02
+
+        # Clamp to gripper joint limits
+        grip_min = self.ros_node.JOINT_LIMITS[7][0]  # -0.1
+        grip_max = self.ros_node.JOINT_LIMITS[7][1]  # 0.5501
+
+        # The gripper joint value maps roughly to finger separation.
+        # Stretch gripper: 0.0 = closed, ~0.55 = fully open (~12cm opening)
+        # Map physical width to joint value: joint ≈ width_m / 0.22
+        # (0.55 joint ≈ 0.12m opening, so 1 joint unit ≈ 0.22m)
+        gripper_joint = max(grip_min, min(grip_max, gripper_aperture / 0.22))
+
+        print(f"  Gripper width: object={object_width_m*100:.1f}cm, "
+              f"aperture={gripper_aperture*100:.1f}cm, joint={gripper_joint:.3f}")
+
+        return gripper_joint
+
+    def _current_manip_joint6(self) -> list[float]:
+        """Return current manipulation-space joint vector for arm_to().
+
+        ordering: [base_x, lift, arm, wrist_yaw, wrist_pitch, wrist_roll]
+        """
+        sensors = self.ros_node.get_sensor_snapshot()
+        # Use bridge-tracked manipulation base_x first (from stretch_ai get_six_joints()).
+        # Generic joint_state[0] ordering can differ and caused base_x restore drift.
+        base_x = None
+        try:
+            with self.ros_node._lock:
+                bx = float(self.ros_node._manip_base_x)
+                if math.isfinite(bx):
+                    base_x = bx
+        except Exception:
+            base_x = None
+        if base_x is None:
+            jp = sensors.get("observation.joint_state.position", [])
+            if isinstance(jp, list) and len(jp) > 0:
+                try:
+                    bx = float(jp[0])
+                    if math.isfinite(bx):
+                        base_x = bx
+                except (TypeError, ValueError):
+                    base_x = None
+        if base_x is None:
+            base_x = 0.0
+        q_actual = self.ros_node.get_actual_qpos()
+        q = list(q_actual[:8]) + [0.0] * max(0, 8 - len(q_actual))
+        return [
+            base_x,
+            float(q[1]),  # lift
+            float(q[0]),  # arm extension
+            float(q[2]),  # wrist_yaw
+            float(q[3]),  # wrist_pitch
+            float(q[4]),  # wrist_roll
+        ]
+
+    def _execute_arm_to_chunked(
+        self,
+        target_joint6: list[float],
+        *,
+        gripper: float | None = None,
+        head: list[float] | None = None,
+        timeout_s: float = 8.0,
+        reliable: bool = False,
+    ) -> bool:
+        """Execute arm_to in small steps using the same delay as manual speed slider."""
+        target = np.asarray(target_joint6, dtype=np.float32).reshape(-1)
+        if target.shape[0] < 6:
+            return False
+        target = target[:6].copy()
+
+        # Clip target into bridge/robot limits.
+        target[0] = float(np.clip(target[0], float(MANIP_BASE_X_LIMITS[0]), float(MANIP_BASE_X_LIMITS[1])))
+        target[1] = float(np.clip(target[1], float(self.ros_node.JOINT_LIMITS[1][0]), float(self.ros_node.JOINT_LIMITS[1][1])))
+        target[2] = float(np.clip(target[2], float(self.ros_node.JOINT_LIMITS[0][0]), float(self.ros_node.JOINT_LIMITS[0][1])))
+        target[3] = float(np.clip(target[3], float(self.ros_node.JOINT_LIMITS[2][0]), float(self.ros_node.JOINT_LIMITS[2][1])))
+        target[4] = float(np.clip(target[4], float(self.ros_node.JOINT_LIMITS[3][0]), float(self.ros_node.JOINT_LIMITS[3][1])))
+        target[5] = float(np.clip(target[5], float(self.ros_node.JOINT_LIMITS[4][0]), float(self.ros_node.JOINT_LIMITS[4][1])))
+
+        current = self._current_manip_joint6()
+        if not (isinstance(current, list) and len(current) >= 6):
+            current = [float(v) for v in target.tolist()]
+        current = np.asarray(current[:6], dtype=np.float32).reshape(-1)
+        if current.shape[0] < 6 or not np.all(np.isfinite(current)):
+            current = target.copy()
+
+        grip_cmd = None
+        if gripper is not None:
+            grip_cmd = float(
+                np.clip(
+                    float(gripper),
+                    float(self.ros_node.JOINT_LIMITS[7][0]),
+                    float(self.ros_node.JOINT_LIMITS[7][1]),
+                )
+            )
+
+        head_cmd = None
+        if isinstance(head, list) and len(head) >= 2:
+            head_cmd = [
+                float(np.clip(float(head[0]), float(self.ros_node.JOINT_LIMITS[5][0]), float(self.ros_node.JOINT_LIMITS[5][1]))),
+                float(np.clip(float(head[1]), float(self.ros_node.JOINT_LIMITS[6][0]), float(self.ros_node.JOINT_LIMITS[6][1]))),
+            ]
+
+        # Match manual stepping semantics: same per-group step sizes and same delay slider.
+        arm_step = max(0.001, abs(float(self.arm_speed)))
+        wrist_step = max(0.002, abs(float(self.wrist_speed)))
+        # Base_x is sent directly (no chunking); only lift/arm/wrist are chunked.
+        # joint6 ordering: [base_x, lift, arm, wrist_yaw, wrist_pitch, wrist_roll]
+        step_limits_nonbase = np.asarray([arm_step, arm_step, wrist_step, wrist_step, wrist_step], dtype=np.float32)
+        delta_nonbase = target[1:] - current[1:]
+        ratios = np.abs(delta_nonbase) / np.maximum(step_limits_nonbase, 1e-6)
+        n_steps = int(max(1, int(np.ceil(float(np.max(ratios))))))
+        delay_s = float(np.clip(float(self.command_smoothing_delay), 0.01, 0.5))
+
+        for i in range(1, n_steps + 1):
+            if self._is_abort_requested():
+                with self._action_lock:
+                    st = self._action_state
+                # During explicit return-to-start, state is idle but abort flag may
+                # still be latched from the prior action abort request.
+                if st != "idle":
+                    return False
+            alpha = float(i) / float(n_steps)
+            step_joint = target.copy()
+            if n_steps > 1:
+                step_joint[1:] = (current[1:] + delta_nonbase * alpha).astype(np.float32)
+            # Directly command IK base_x target each send (no base_x chunking).
+            step_joint[0] = float(target[0])
+            is_last = i == n_steps
+            pre_stamp_ns = None
+            if hasattr(self.ros_node, "_latest_ros_observation_stamp_ns"):
+                try:
+                    pre_stamp_ns = self.ros_node._latest_ros_observation_stamp_ns()
+                except Exception:
+                    pre_stamp_ns = None
+            ok = self.ros_node.execute_arm_to(
+                step_joint[:6].tolist(),
+                gripper=grip_cmd,
+                head=head_cmd,
+                # Stream intermediate chunks quickly; only final chunk blocks/checks reached.
+                blocking=bool(is_last),
+                timeout_s=float(timeout_s) if is_last else max(0.8, min(2.0, float(timeout_s))),
+                reliable=bool(reliable),
+            )
+            if not ok and is_last:
+                return False
+            if hasattr(self.ros_node, "_refresh_state_from_ros_topic"):
+                try:
+                    self.ros_node._refresh_state_from_ros_topic(
+                        require_newer_than_ns=pre_stamp_ns,
+                        timeout_s=0.60 if is_last else 0.20,
+                    )
+                except Exception:
+                    pass
+            if i < n_steps and delay_s > 0.0:
+                time.sleep(delay_s)
+        return True
+
+    def _freeze_streaming_commands_to_current_state(self) -> None:
+        """Avoid command-loop interference while running blocking scripted motions."""
+        try:
+            with self.ros_node._lock:
+                cur = self.ros_node.actual_qpos
+                if isinstance(cur, list) and len(cur) >= 10:
+                    self.ros_node.qpos = list(cur[:10])
+                    self.ros_node.published_qpos = list(cur[:10])
+                    self.ros_node.qpos[8] = 0.0
+                    self.ros_node.qpos[9] = 0.0
+                    self.ros_node.published_qpos[8] = 0.0
+                    self.ros_node.published_qpos[9] = 0.0
+                    self.ros_node._base_linear_cmd = 0.0
+                    self.ros_node._base_angular_cmd = 0.0
+                    self.ros_node._needs_mode_retry = False
+        except Exception:
+            pass
+
+    def _execute_approach_with_stretch_ai_ik(
+        self,
+        point_base,
+        *,
+        mode: str,
+        grasp_yaw: float | None = None,
+        gripper_width: float | None = None,
+        wrist_pitch_target: float | None = None,
+        wrist_roll_target: float | None = None,
+        grasp_shape_info: dict[str, Any] | None = None,
+        preserve_existing_pre_action_state: bool = False,
+        target_world_xyz_override: tuple[float, float, float] | list[float] | None = None,
+        preplanned_grasp_joint6: list[float] | tuple[float, ...] | np.ndarray | None = None,
+    ) -> None:
+        """v6 approach: use stretch_ai IK/open-loop planning instead of manual geometry."""
+        import time
+
+        def _wait_with_pause(duration_s: float) -> bool:
+            duration_s = min(float(SCRIPT_STAGE_WAIT_CAP_S), max(0.0, float(duration_s)))
+            end_t = time.time() + duration_s
+            while time.time() < end_t:
+                if self._is_abort_requested():
+                    return False
+                with self._action_lock:
+                    st = self._action_state
+                if st in ("paused", "awaiting_confirm"):
+                    time.sleep(0.05)
+                    continue
+                time.sleep(min(0.05, max(0.0, end_t - time.time())))
+            return not self._is_abort_requested()
+
+        def _wait_until_running() -> bool:
+            while True:
+                if self._is_abort_requested():
+                    return False
+                with self._action_lock:
+                    st = self._action_state
+                if st == "running":
+                    return True
+                time.sleep(0.05)
+
+        def _wait_for_base_x_target(target_base_x: float, tol_m: float = 0.008, timeout_s: float = 8.0) -> bool:
+            """Wait until manipulation base_x reaches target (within tolerance)."""
+            end_t = time.time() + max(0.1, float(timeout_s))
+            target = float(target_base_x)
+            tol = abs(float(tol_m))
+            while time.time() < end_t:
+                if self._is_abort_requested():
+                    return False
+                with self._action_lock:
+                    st = self._action_state
+                if st in ("paused", "awaiting_confirm", "awaiting_post_grasp"):
+                    time.sleep(0.05)
+                    continue
+                cur = self._current_manip_joint6()
+                if isinstance(cur, list) and len(cur) >= 1:
+                    try:
+                        cur_x = float(cur[0])
+                        if math.isfinite(cur_x) and abs(cur_x - target) <= tol:
+                            return True
+                    except (TypeError, ValueError):
+                        pass
+                time.sleep(0.05)
+            return False
+
+        def _abort_and_return() -> None:
+            if self._consume_skip_to_next_goal_request():
+                print("Action aborted by user. Skipping to next queued goal...")
+                self._set_action_state("idle")
+                return
+            user_abort_requested = self._is_abort_requested()
+            self._set_action_state("idle")
+
+            # If user explicitly requested abort/return while action was active,
+            # keep existing behavior and auto-return to saved start.
+            if user_abort_requested:
+                print("Action aborted by user. Returning to start...")
+                if self._pre_action_state is not None:
+                    self.return_to_start()
+                return
+
+            # Failure path: hold current pose, do not auto-return.
+            # Keep Return enabled so user can decide when to go back.
+            print("Action failed. Holding current pose; use Return to go back.")
+            self.ros_node.sync_command_targets_to_actual()
+            self._set_return_enabled(True)
+            self._set_status(
+                "Action failed. Holding position. Adjust manually or press Return.",
+                "QLabel { color: orange; font-size: 10px; }",
+            )
+
+        # Save current state so return_to_start() can restore it.
+        if (not preserve_existing_pre_action_state) or (self._pre_action_state is None):
+            manip0 = self._current_manip_joint6()
+            base_x0 = float(manip0[0]) if isinstance(manip0, list) and len(manip0) >= 1 else 0.0
+            wrist_roll0 = float(manip0[5]) if isinstance(manip0, list) and len(manip0) >= 6 else float(self.ros_node.qpos[4])
+            base_pose0 = self.ros_node.get_measured_base_pose_xytheta()
+            if not (isinstance(base_pose0, list) and len(base_pose0) >= 3):
+                base_pose0 = [0.0, 0.0, 0.0]
+            self._pre_action_state = {
+                "arm_ext": self.ros_node.qpos[0],
+                "lift": self.ros_node.qpos[1],
+                "wrist_yaw": self.ros_node.qpos[2],
+                "wrist_pitch": self.ros_node.qpos[3],
+                "wrist_roll": wrist_roll0,
+                "base_x": base_x0,
+                "base_pose_xytheta_start": [float(base_pose0[0]), float(base_pose0[1]), float(base_pose0[2])],
+                "gripper": self.ros_node.qpos[7],
+                "head_pan": self.ros_node.qpos[5],
+                "head_tilt": self.ros_node.qpos[6],
+                "rotation_applied": 0.0,
+            }
+            yaw0 = self._get_current_base_yaw()
+            if yaw0 is not None:
+                self._pre_action_state["base_yaw_start"] = float(yaw0)
+
+        target_base_xyz = (
+            float(point_base.point.x),
+            float(point_base.point.y),
+            float(point_base.point.z),
+        )
+        target_world_xyz = None
+        if isinstance(target_world_xyz_override, (list, tuple)) and len(target_world_xyz_override) >= 3:
+            try:
+                tx = float(target_world_xyz_override[0])
+                ty = float(target_world_xyz_override[1])
+                tz = float(target_world_xyz_override[2])
+                if math.isfinite(tx) and math.isfinite(ty) and math.isfinite(tz):
+                    target_world_xyz = (tx, ty, tz)
+            except Exception:
+                target_world_xyz = None
+        if target_world_xyz is None:
+            base_pose = self.ros_node.get_measured_base_pose_xytheta()
+            if not (isinstance(base_pose, list) and len(base_pose) >= 3):
+                base_pose = [0.0, 0.0, 0.0]
+            target_world_xyz = self._base_point_to_odom_xyz(target_base_xyz, base_pose)
+
+        print(f"[IK pipeline] mode={mode} target_base={target_base_xyz} target_world={target_world_xyz}")
+        self._freeze_streaming_commands_to_current_state()
+
+        # Safety pre-step: ensure minimum lift before any IK planning/execution.
+        # This is intentionally done before plan_open_loop_grasp().
+        min_lift_m = float(IK_SAFE_LIFT_M)
+        precheck_joint = self._current_manip_joint6()
+        if isinstance(precheck_joint, list) and len(precheck_joint) >= 6:
+            current_lift = float(precheck_joint[1])
+            if current_lift < float(min_lift_m):
+                self._set_status(
+                    f"IK pipeline: raising lift to {min_lift_m:.2f}m before planning...",
+                    "QLabel { color: blue; font-size: 10px; }",
+                )
+                precheck_joint = [float(v) for v in precheck_joint[:6]]
+                precheck_joint[1] = float(
+                    np.clip(
+                        float(min_lift_m),
+                        float(self.ros_node.JOINT_LIMITS[1][0]),
+                        float(self.ros_node.JOINT_LIMITS[1][1]),
+                    )
+                )
+                if not self._execute_arm_to_chunked(
+                    precheck_joint[:6],
+                    gripper=None,
+                    timeout_s=8.0,
+                    reliable=False,
+                ):
+                    self._set_status(
+                        f"IK pipeline: pre-lift to {min_lift_m:.2f}m failed",
+                        "QLabel { color: red; font-size: 10px; }",
+                    )
+                    _abort_and_return()
+                    return
+                if not _wait_with_pause(0.2):
+                    _abort_and_return()
+                    return
+
+        # Step 1: plan IK targets directly from the clicked world-frame point.
+        # No manual pre-rotation/pre-lift: execute exactly what IK returns.
+        grasp_joint = None
+        if mode == "reach" and preplanned_grasp_joint6 is not None:
+            try:
+                pre = np.asarray(preplanned_grasp_joint6, dtype=np.float32).reshape(-1)
+                if pre.shape[0] >= 6 and np.all(np.isfinite(pre[:6])):
+                    grasp_joint = [float(v) for v in pre[:6].tolist()]
+            except Exception:
+                grasp_joint = None
+        if grasp_joint is not None:
+            self._set_status(
+                "IK pipeline: using precomputed reach target...",
+                "QLabel { color: blue; font-size: 10px; }",
+            )
+        else:
+            self._set_status("IK pipeline: planning pregrasp/grasp targets...", "QLabel { color: blue; font-size: 10px; }")
+            plan = self.ros_node.plan_open_loop_grasp(
+                target_world_xyz,
+                pregrasp_distance=IK_PREGRASP_DISTANCE_M if mode == "grasp" else 0.20,
+                lift_distance=IK_LIFT_DISTANCE_M,
+                wrist_yaw_target=(None if grasp_yaw is None else float(grasp_yaw)),
+                wrist_pitch_target=(
+                    float(wrist_pitch_target)
+                    if wrist_pitch_target is not None
+                    else float(np.deg2rad(GRASP_PITCH_DEG))
+                ),
+                wrist_roll_target=(None if wrist_roll_target is None else float(wrist_roll_target)),
+                timeout_s=35.0,
+            )
+            if isinstance(plan, dict):
+                err0 = str(plan.get("error", ""))
+                if (not plan.get("ok", False)) and ("Timeout waiting for worker response to 'plan_open_loop_grasp'" in err0):
+                    self._set_status("IK pipeline: planner timeout; retrying...", "QLabel { color: orange; font-size: 10px; }")
+                    plan = self.ros_node.plan_open_loop_grasp(
+                        target_world_xyz,
+                        pregrasp_distance=IK_PREGRASP_DISTANCE_M if mode == "grasp" else 0.20,
+                        lift_distance=IK_LIFT_DISTANCE_M,
+                        wrist_yaw_target=(None if grasp_yaw is None else float(grasp_yaw)),
+                        wrist_pitch_target=(
+                            float(wrist_pitch_target)
+                            if wrist_pitch_target is not None
+                            else float(np.deg2rad(GRASP_PITCH_DEG))
+                        ),
+                        wrist_roll_target=(None if wrist_roll_target is None else float(wrist_roll_target)),
+                        timeout_s=70.0,
+                    )
+            if not isinstance(plan, dict) or not plan.get("ok", False):
+                err = "IK planning failed" if not isinstance(plan, dict) else str(plan.get("error", "IK planning failed"))
+                self._set_status(f"IK pipeline: {err}", "QLabel { color: red; font-size: 10px; }")
+                _abort_and_return()
+                return
+
+            grasp_joint = plan.get("grasp_joint")
+            if not (isinstance(grasp_joint, list) and len(grasp_joint) >= 6):
+                self._set_status("IK pipeline: invalid grasp target", "QLabel { color: red; font-size: 10px; }")
+                _abort_and_return()
+                return
+        # No separate pregrasp joint from planner.
+        # Move to final grasp geometry immediately, but keep lift +10cm above target.
+        target_lift = float(grasp_joint[1])
+        target_lift_plus_margin = float(
+            np.clip(
+                # max(float(IK_SAFE_LIFT_M), float(target_lift) + IK_REACH_STANDOFF_M),
+                float(target_lift) + IK_REACH_STANDOFF_M,
+                float(self.ros_node.JOINT_LIMITS[1][0]),
+                float(self.ros_node.JOINT_LIMITS[1][1]),
+            )
+        )
+        approach_joint = [float(v) for v in grasp_joint[:6]]
+        # Apply calibration offset only for grasp mode.
+        # Reach mode should use IK base_x directly.
+        base_x_cmd = float(approach_joint[0])
+        if mode == "grasp":
+            base_x_cmd = float(base_x_cmd + float(IK_GRASP_BASE_X_OFFSET_M))
+        approach_joint[0] = float(
+            np.clip(
+                float(base_x_cmd),
+                float(MANIP_BASE_X_LIMITS[0]),
+                float(MANIP_BASE_X_LIMITS[1]),
+            )
+        )
+        grasp_strategy = "lift_standoff"
+        if mode == "grasp" and isinstance(grasp_shape_info, dict):
+            grasp_strategy = str(grasp_shape_info.get("approach_strategy", "lift_standoff"))
+
+        # Reach-specific two-stage lift behavior:
+        # 1) approach with lift held >=0.9m while base_x/arm settle
+        # 2) only then adjust to (target_lift + 0.1m)
+        reach_lift_current = float(IK_SAFE_LIFT_M)
+        cur_joint6_for_reach = self._current_manip_joint6()
+        if isinstance(cur_joint6_for_reach, list) and len(cur_joint6_for_reach) >= 2:
+            try:
+                reach_lift_current = float(cur_joint6_for_reach[1])
+            except (TypeError, ValueError):
+                reach_lift_current = float(IK_SAFE_LIFT_M)
+        reach_lift_stage1 = float(
+            np.clip(
+                max(float(IK_SAFE_LIFT_M), float(reach_lift_current)),
+                # float(reach_lift_current),
+                float(self.ros_node.JOINT_LIMITS[1][0]),
+                float(self.ros_node.JOINT_LIMITS[1][1]),
+            )
+        )
+        if mode == "reach":
+            approach_joint[1] = float(reach_lift_stage1)
+        elif mode == "grasp" and grasp_strategy == "reach_standoff":
+            # Vertical-face style grasp: keep target lift and pause at reach-10cm.
+            approach_joint[1] = float(
+                np.clip(
+                    # max(float(IK_SAFE_LIFT_M), float(target_lift)),
+                    float(target_lift),
+                    float(self.ros_node.JOINT_LIMITS[1][0]),
+                    float(self.ros_node.JOINT_LIMITS[1][1]),
+                )
+            )
+            approach_joint[2] = float(
+                np.clip(
+                    float(grasp_joint[2]) - float(IK_REACH_STANDOFF_M),
+                    float(self.ros_node.JOINT_LIMITS[0][0]),
+                    float(self.ros_node.JOINT_LIMITS[0][1]),
+                )
+            )
+        else:
+            approach_joint[1] = float(target_lift_plus_margin)
+
+        # Step 2: move to grasp pose with lift hold and wait for user verification.
+        if mode == "grasp" and grasp_strategy == "reach_standoff":
+            self._set_status(
+                f"IK pipeline: moving to reach standoff (-{IK_REACH_STANDOFF_M*100:.0f}cm)...",
+                "QLabel { color: blue; font-size: 10px; }",
+            )
+        else:
+            self._set_status("IK pipeline: moving to grasp pose (+10cm lift hold)...", "QLabel { color: blue; font-size: 10px; }")
+        if mode == "grasp":
+            if isinstance(gripper_width, (int, float)) and np.isfinite(float(gripper_width)):
+                gripper_open = float(
+                    np.clip(
+                        float(gripper_width),
+                        float(self.ros_node.JOINT_LIMITS[7][0]),
+                        float(self.ros_node.JOINT_LIMITS[7][1]),
+                    )
+                )
+            else:
+                gripper_open = float(self.ros_node.JOINT_LIMITS[7][1])
+            # Initialize manual override tracking from planner open width.
+            self._set_manual_gripper_override(gripper_open)
+        else:
+            gripper_open = None
+
+        if not self._execute_arm_to_chunked(
+            approach_joint[:6],
+            gripper=gripper_open,
+            timeout_s=8.0,
+            reliable=False,
+        ):
+            self._set_status("IK pipeline: approach move failed", "QLabel { color: red; font-size: 10px; }")
+            _abort_and_return()
+            return
+        if not _wait_with_pause(0.3):
+            _abort_and_return()
+            return
+
+        if mode == "reach":
+            stage2_base_x = float(approach_joint[0])
+            # Stage-2: wait until base_x settles, then adjust lift to target_lift+0.1m.
+            self._set_status(
+                "Reach: waiting for base_x to reach target before lowering lift...",
+                "QLabel { color: blue; font-size: 10px; }",
+            )
+            if not _wait_for_base_x_target(float(stage2_base_x), tol_m=0.008, timeout_s=8.0):
+                self._set_status(
+                    "IK pipeline: base_x did not settle at target; skipping lift-down",
+                    "QLabel { color: red; font-size: 10px; }",
+                )
+                _abort_and_return()
+                return
+            self._set_status(
+                f"Reach: adjusting lift from {reach_lift_stage1:.2f}m to target+0.10m...",
+                "QLabel { color: blue; font-size: 10px; }",
+            )
+            # Do not replay planned base_x here. Only adjust lift from the *current*
+            # pose so manual base edits are preserved.
+            reach_lower_joint = self._current_manip_joint6()
+            if not (isinstance(reach_lower_joint, list) and len(reach_lower_joint) >= 6):
+                reach_lower_joint = [float(v) for v in approach_joint[:6]]
+            reach_lower_joint = [float(v) for v in reach_lower_joint[:6]]
+            reach_lower_joint[1] = float(target_lift_plus_margin)
+            if not self._execute_arm_to_chunked(
+                reach_lower_joint[:6],
+                gripper=None,
+                timeout_s=8.0,
+                reliable=False,
+            ):
+                self._set_status("IK pipeline: reach lift adjust failed", "QLabel { color: red; font-size: 10px; }")
+                _abort_and_return()
+                return
+            if not _wait_with_pause(0.3):
+                _abort_and_return()
+                return
+            # Ensure subsequent manual controls (e.g., gripper buttons) start from
+            # the measured post-reach pose and do not replay stale command targets.
+            self.ros_node.sync_command_targets_to_actual()
+            self._set_return_enabled(True)
+            self._set_status("Reach completed (IK approach).", "QLabel { color: green; font-size: 10px; }")
+            return
+
+        # Sync command targets so manual tweaks during pause start from live robot state.
+        self.ros_node.sync_command_targets_to_actual()
+        if grasp_strategy == "reach_standoff":
+            self._set_status(
+                f"At reach standoff (-{IK_REACH_STANDOFF_M*100:.0f}cm). Press Continue to advance and grasp.",
+                "QLabel { color: orange; font-size: 10px; }",
+            )
+        else:
+            self._set_status("At approach hold (+10cm). Press Continue to lower lift and grasp.", "QLabel { color: orange; font-size: 10px; }")
+        self._set_action_state("awaiting_confirm")
+        if not _wait_until_running():
+            _abort_and_return()
+            return
+
+        # Step 3:
+        # - horizontal/top objects: lower lift to target grasp
+        # - vertical-like objects: keep lift and advance arm reach from standoff
+        lower_joint = self._current_manip_joint6()
+        if not (isinstance(lower_joint, list) and len(lower_joint) >= 6):
+            lower_joint = [float(v) for v in approach_joint[:6]]
+        lower_joint = [float(v) for v in lower_joint[:6]]
+        if grasp_strategy == "reach_standoff":
+            self._set_status("IK pipeline: advancing reach to target grasp...", "QLabel { color: blue; font-size: 10px; }")
+            lower_joint[1] = float(
+                np.clip(
+                    float(target_lift),
+                    float(self.ros_node.JOINT_LIMITS[1][0]),
+                    float(self.ros_node.JOINT_LIMITS[1][1]),
+                )
+            )
+            lower_joint[2] = float(
+                np.clip(
+                    float(grasp_joint[2]),
+                    float(self.ros_node.JOINT_LIMITS[0][0]),
+                    float(self.ros_node.JOINT_LIMITS[0][1]),
+                )
+            )
+        else:
+            self._set_status("IK pipeline: lowering lift to target grasp...", "QLabel { color: blue; font-size: 10px; }")
+            lower_joint[1] = float(
+                np.clip(
+                    float(target_lift),
+                    float(self.ros_node.JOINT_LIMITS[1][0]),
+                    float(self.ros_node.JOINT_LIMITS[1][1]),
+                )
+            )
+        gripper_preclose = gripper_open
+        if mode == "grasp":
+            # Respect any manual gripper edits made during pause before Continue.
+            g_manual = self._get_manual_gripper_target(fallback=gripper_open)
+            if g_manual is None:
+                g_manual = gripper_open
+            gripper_preclose = float(
+                np.clip(
+                    float(g_manual),
+                    float(self.ros_node.JOINT_LIMITS[7][0]),
+                    float(self.ros_node.JOINT_LIMITS[7][1]),
+                )
+            )
+            self._set_manual_gripper_override(gripper_preclose)
+
+        if not self._execute_arm_to_chunked(
+            lower_joint[:6],
+            gripper=gripper_preclose,
+            timeout_s=8.0,
+            reliable=False,
+        ):
+            self._set_status("IK pipeline: lift lower failed", "QLabel { color: red; font-size: 10px; }")
+            _abort_and_return()
+            return
+        if not _wait_with_pause(0.3):
+            _abort_and_return()
+            return
+
+        # Partial close to avoid hard motor overload:
+        # close around object width by reducing from open target by 2-5cm equivalent.
+        gripper_delta_joint = float(IK_GRIPPER_CLOSE_DELTA_M) / 0.22
+        gripper_closed = float(
+            np.clip(
+                float(gripper_preclose) - float(gripper_delta_joint),
+                float(IK_GRIPPER_CLOSE_MIN_JOINT),
+                float(self.ros_node.JOINT_LIMITS[7][1]),
+            )
+        )
+        gripper_closed = float(min(float(gripper_preclose), float(gripper_closed)))
+        print(
+            f"[IK gripper] open={gripper_preclose:+.3f}, close={gripper_closed:+.3f}, "
+            f"delta_m={IK_GRIPPER_CLOSE_DELTA_M:.3f}"
+        )
+        if not self._execute_arm_to_chunked(
+            lower_joint[:6],
+            gripper=gripper_closed,
+            timeout_s=6.0,
+            reliable=False,
+        ):
+            self._set_status("IK pipeline: gripper close failed", "QLabel { color: red; font-size: 10px; }")
+            _abort_and_return()
+            return
+        # Mark B1 as pressed-state after scripted grasp close so device toggle
+        # logic starts from a safe latched state.
+        self._device_b1_open_next = True
+        if not _wait_with_pause(0.3):
+            _abort_and_return()
+            return
+
+        # Pause after grasp close for user verification before lift.
+        self._set_manual_gripper_override(gripper_closed)
+        self._set_return_enabled(True)
+        self.ros_node.sync_command_targets_to_actual()
+        self._set_status("Grasp closed. Verify hold, then press Continue to lift.", "QLabel { color: orange; font-size: 10px; }")
+        self._set_action_state("awaiting_post_grasp")
+        if not _wait_until_running():
+            _abort_and_return()
+            return
+
+        # Lift after grasp from *current* pose only (do not reuse planner base_x).
+        lift_after_joint = self._current_manip_joint6()
+        if not (isinstance(lift_after_joint, list) and len(lift_after_joint) >= 6):
+            lift_after_joint = [float(v) for v in lower_joint[:6]]
+        lift_after_joint = [float(v) for v in lift_after_joint[:6]]
+        lift_after_joint[1] = float(
+            np.clip(
+                float(lift_after_joint[1]) + float(IK_LIFT_DISTANCE_M),
+                float(self.ros_node.JOINT_LIMITS[1][0]),
+                float(self.ros_node.JOINT_LIMITS[1][1]),
+            )
+        )
+        gripper_lift = self._get_manual_gripper_target(fallback=gripper_closed)
+        if gripper_lift is None:
+            gripper_lift = gripper_closed
+        self._set_manual_gripper_override(gripper_lift)
+        self._execute_arm_to_chunked(
+            lift_after_joint[:6],
+            gripper=gripper_lift,
+            timeout_s=6.0,
+            reliable=False,
+        )
+        _wait_with_pause(0.3)
+
+        self._set_return_enabled(True)
+        self._set_action_state("idle")
+        self._set_status("Grasp completed and lifted. Use Return when ready.", "QLabel { color: green; font-size: 10px; }")
+
+    def _execute_approach(self, point_base, mode='reach', height_clearance=REACH_HEIGHT_CLEARANCE,
+                          grasp_yaw=None, gripper_width=None, object_top_z=None,
+                          grasp_mask=None, long_axis_angle=None,
+                          wrist_pitch_target=None, wrist_roll_target=None,
+                          grasp_shape_info=None,
+                          preserve_existing_pre_action_state=False,
+                          target_world_xyz_override=None,
+                          preplanned_grasp_joint6=None):
+        """Execute reach/grasp via the v6 IK pipeline.
+
+        The legacy manual geometry path was removed to keep v6 deterministic and
+        maintainable. All scripted approach motions should use stretch_ai IK RPCs.
+        """
+        # Keep signature compatibility with existing v5-style callers.
+        _ = (height_clearance, object_top_z, grasp_mask, long_axis_angle)
+
+        if not USE_STRETCH_AI_IK_GRASP_PIPELINE:
+            raise RuntimeError(
+                "Manual approach pipeline has been removed from v6. "
+                "Enable USE_STRETCH_AI_IK_GRASP_PIPELINE."
+            )
+
+        return self._execute_approach_with_stretch_ai_ik(
+            point_base,
+            mode=str(mode),
+            grasp_yaw=(None if grasp_yaw is None else float(grasp_yaw)),
+            gripper_width=(None if gripper_width is None else float(gripper_width)),
+            wrist_pitch_target=(None if wrist_pitch_target is None else float(wrist_pitch_target)),
+            wrist_roll_target=(None if wrist_roll_target is None else float(wrist_roll_target)),
+            grasp_shape_info=(grasp_shape_info if isinstance(grasp_shape_info, dict) else None),
+            preserve_existing_pre_action_state=bool(preserve_existing_pre_action_state),
+            target_world_xyz_override=target_world_xyz_override,
+            preplanned_grasp_joint6=preplanned_grasp_joint6,
+        )
+
+    def reach_object(self):
+        """Move arm above selected object (no gripper action)"""
+        if not self._begin_action('reach'):
+            self._set_status("Another action is already running/paused",
+                             "QLabel { color: orange; font-size: 10px; }")
+            return
+
+        if self.selected_segment is None or self.head_rgb is None:
+            self._set_action_state('idle')
+            self._set_status("No object selected", "QLabel { color: red; }")
+            return
+
+        cx, cy = self.selected_segment['center']
+        point_base, depth = self._get_3d_point_at_pixel(cx, cy)
+        if point_base is None:
+            self._set_action_state('idle')
+            self._set_status("Failed to get 3D position", "QLabel { color: red; }")
+            return
+
+        # Compute object top height for collision avoidance
+        object_top_z = None
+        mask = self.selected_segment.get('mask')
+        if mask is not None:
+            object_top_z = self._compute_object_top_z(mask)
+
+        print(f"\n{'='*60}")
+        print(f"REACH (10cm above object)")
+        if object_top_z is not None:
+            print(f"  Object top Z: {object_top_z:.3f}m (base_link)")
+        print(f"{'='*60}")
+
+        self._set_status("Reaching above object...", "QLabel { color: blue; font-size: 10px; }")
+
+        def run():
+            try:
+                self._execute_approach(point_base, mode='reach', height_clearance=REACH_HEIGHT_CLEARANCE,
+                                       object_top_z=object_top_z)
+            except Exception as e:
+                print(f"Reach error: {e}")
+                import traceback
+                traceback.print_exc()
+                self._set_status(f"Reach failed: {str(e)}", "QLabel { color: red; font-size: 10px; }")
+            finally:
+                with self._action_lock:
+                    st = self._action_state
+                if st == 'running':
+                    self._set_action_state('idle')
+
+        from threading import Thread
+        Thread(target=run, daemon=True).start()
+
+    def _pixel_from_event(self, event):
+        """Convert a mouse event position to image pixel coordinates."""
+        if self.head_rgb is None:
+            return None, None
+        px = int(event.pos().x() * self.head_rgb.shape[1] / self.head_display.width())
+        py = int(event.pos().y() * self.head_rgb.shape[0] / self.head_display.height())
+        return px, py
+
+    def _center_on_pixel(self, px, py):
+        """Center camera on a pixel in the rotated image."""
+        if self.head_rgb is None:
+            return
+        img_height, img_width = self.head_rgb.shape[:2]
+        offset_x = (px - img_width // 2) / img_width
+        offset_y = (py - img_height // 2) / img_height
+        pan_adj = -offset_x * 0.2
+        tilt_adj = offset_y * 0.2
+        print(f"Centering camera on pixel ({px}, {py}): pan={pan_adj:.3f}, tilt={tilt_adj:.3f}")
+        self.robot_controller.adjust_control('head_pan', pan_adj)
+        self.robot_controller.adjust_control('head_tilt', tilt_adj)
+        self.status_label.setText("Centering camera...")
+        self.status_label.setStyleSheet("QLabel { color: blue; }")
+
+    def _find_segment_at_pixel(self, px, py):
+        if not self.segments:
+            return None
+        for seg in self.segments:
+            if py < seg['mask'].shape[0] and px < seg['mask'].shape[1] and seg['mask'][py, px] > 0:
+                return seg
+        return None
+
+    def _point_from_xyz(self, xyz):
+        point = PointStamped()
+        point.header.frame_id = 'base_link'
+        point.header.stamp = self.ros_node.get_clock().now().to_msg()
+        point.point.x = float(xyz[0])
+        point.point.y = float(xyz[1])
+        point.point.z = float(xyz[2])
+        return point
+
+    @staticmethod
+    def _base_point_to_odom_xyz(point_xyz, base_pose_xytheta):
+        """Convert point from base_link frame into odom/world XY using base pose."""
+        px, py, pz = [float(v) for v in point_xyz]
+        bx, by, bt = [float(v) for v in base_pose_xytheta]
+        c = math.cos(bt)
+        s = math.sin(bt)
+        ox = bx + c * px - s * py
+        oy = by + s * px + c * py
+        return (float(ox), float(oy), float(pz))
+
+    @staticmethod
+    def _odom_point_to_base_xyz(point_xyz, base_pose_xytheta):
+        """Convert point from odom/world XY into current base_link frame."""
+        ox, oy, oz = [float(v) for v in point_xyz]
+        bx, by, bt = [float(v) for v in base_pose_xytheta]
+        dx = ox - bx
+        dy = oy - by
+        c = math.cos(bt)
+        s = math.sin(bt)
+        px = c * dx + s * dy
+        py = -s * dx + c * dy
+        return (float(px), float(py), float(oz))
+
+    def _resolve_goal_point_xyz_for_current_base(self, goal):
+        """Resolve queued goal point for current base pose.
+
+        For queued goals, use odom-anchored coordinates when available so that
+        sequential goals are relative to current heading/pose (e.g., z-y, not z-x).
+        """
+        fallback_xyz = goal.get("point_xyz")
+        if not (isinstance(fallback_xyz, (list, tuple)) and len(fallback_xyz) >= 3):
+            return None
+        fallback_xyz = (float(fallback_xyz[0]), float(fallback_xyz[1]), float(fallback_xyz[2]))
+
+        odom_xyz = goal.get("point_odom_xyz")
+        if not (isinstance(odom_xyz, (list, tuple)) and len(odom_xyz) >= 3):
+            return fallback_xyz
+
+        base_pose = self.ros_node.get_measured_base_pose_xytheta()
+        if not (isinstance(base_pose, (list, tuple)) and len(base_pose) >= 3):
+            return fallback_xyz
+
+        try:
+            return self._odom_point_to_base_xyz(
+                (float(odom_xyz[0]), float(odom_xyz[1]), float(odom_xyz[2])),
+                (float(base_pose[0]), float(base_pose[1]), float(base_pose[2])),
+            )
+        except Exception:
+            return fallback_xyz
+
+    def _prepare_reach_goal_from_pixel(self, px, py):
+        point_base, depth = self._get_3d_point_at_pixel(px, py)
+        if point_base is None:
+            return None, "No valid depth at clicked point"
+
+        object_top_z = None
+        seg = self._find_segment_at_pixel(px, py)
+        if seg is not None:
+            object_top_z = self._compute_object_top_z(seg['mask'])
+
+        point_xyz = (float(point_base.point.x), float(point_base.point.y), float(point_base.point.z))
+        base_pose = self.ros_node.get_measured_base_pose_xytheta()
+        point_odom_xyz = None
+        if isinstance(base_pose, (list, tuple)) and len(base_pose) >= 3:
+            point_odom_xyz = self._base_point_to_odom_xyz(
+                point_xyz,
+                (float(base_pose[0]), float(base_pose[1]), float(base_pose[2])),
+            )
+
+        goal = {
+            "kind": "reach",
+            "px": int(px),
+            "py": int(py),
+            "depth": float(depth),
+            "point_xyz": point_xyz,
+            "point_odom_xyz": point_odom_xyz,
+            "object_top_z": None if object_top_z is None else float(object_top_z),
+            "created_time": float(time.time()),
+        }
+        return goal, None
+
+    def _prepare_grasp_goal_from_pixel(self, px, py, segment=None):
+        point_base, depth = self._get_3d_point_at_pixel(px, py)
+        if point_base is None:
+            return None, "No valid depth at clicked point"
+        if depth < 0.1 or depth > 2.0:
+            return None, f"Object too far or invalid depth: {depth:.2f}m"
+
+        mask = None
+        if segment is not None:
+            mask = segment['mask']
+        else:
+            seg = self._find_segment_at_pixel(px, py)
+            if seg is not None:
+                mask = seg['mask']
+        if mask is None and self.selected_segment is not None and 'mask' in self.selected_segment:
+            sel_mask = self.selected_segment['mask']
+            if py < sel_mask.shape[0] and px < sel_mask.shape[1]:
+                mask = sel_mask
+
+        if mask is None:
+            return None, "No segment mask at clicked point"
+
+        gripper_width = None
+        rect_info = None
+        object_top_z = None
+        long_axis_angle = None
+        grasp_yaw, rect_info = self._compute_grasp_orientation(mask, px, py)
+        gripper_width = self._estimate_gripper_width(mask, px, py, depth, rect_info)
+        object_top_z = self._compute_object_top_z(mask)
+        if rect_info is not None and rect_info.get('top_z_max') is not None:
+            top_from_grasp_fit = float(rect_info['top_z_max'])
+            object_top_z = top_from_grasp_fit if object_top_z is None else max(float(object_top_z), top_from_grasp_fit)
+        if rect_info is not None:
+            import math as _m
+            long_axis_angle = _m.radians(rect_info['long_axis_angle_deg'])
+
+        if object_top_z is None:
+            return None, "Could not estimate object top surface"
+
+        point_x = float(point_base.point.x)
+        point_y = float(point_base.point.y)
+        point_z = float(point_base.point.z)
+        if isinstance(rect_info, dict):
+            center_xy = rect_info.get("center")
+            if isinstance(center_xy, (list, tuple)) and len(center_xy) >= 2:
+                try:
+                    cx = float(center_xy[0])
+                    cy = float(center_xy[1])
+                    if math.isfinite(cx) and math.isfinite(cy):
+                        point_x = cx
+                        point_y = cy
+                except (TypeError, ValueError):
+                    pass
+            plane_z = rect_info.get("plane_z")
+            if isinstance(plane_z, (int, float)):
+                pz = float(plane_z)
+                if math.isfinite(pz):
+                    point_z = pz
+        if object_top_z is not None and isinstance(object_top_z, (int, float)):
+            oz = float(object_top_z)
+            if math.isfinite(oz):
+                point_z = float(oz - float(GRASP_TARGET_Z_OFFSET_M))
+        point_xyz = (float(point_x), float(point_y), float(point_z))
+        base_pose = self.ros_node.get_measured_base_pose_xytheta()
+        point_odom_xyz = None
+        if isinstance(base_pose, (list, tuple)) and len(base_pose) >= 3:
+            point_odom_xyz = self._base_point_to_odom_xyz(
+                point_xyz,
+                (float(base_pose[0]), float(base_pose[1]), float(base_pose[2])),
+            )
+
+        goal = {
+            "kind": "grasp",
+            "px": int(px),
+            "py": int(py),
+            "depth": float(depth),
+            "point_xyz": point_xyz,
+            "point_odom_xyz": point_odom_xyz,
+            "object_top_z": float(object_top_z),
+            "grasp_yaw": None if grasp_yaw is None else float(grasp_yaw),
+            "gripper_width": None if gripper_width is None else float(gripper_width),
+            "long_axis_angle": None if long_axis_angle is None else float(long_axis_angle),
+            "grasp_mask": np.array(mask, copy=True),
+            "grasp_debug_info": None if rect_info is None else dict(rect_info),
+            "created_time": float(time.time()),
+        }
+        return goal, None
+
+    def _store_queued_goal(self, goal):
+        if goal is None:
+            return
+        self.queued_goals[goal["kind"]] = goal
+        self._reset_goal_sequence_progress()
+        self._set_status(
+            f"Queued {goal['kind']} goal at ({goal['px']}, {goal['py']})",
+            "QLabel { color: #1e88e5; font-size: 10px; }"
+        )
+
+    def _precompute_followup_reach_from_grasp_goal(self, grasp_goal: dict[str, Any]) -> None:
+        """Precompute queued reach IK target before executing queued grasp.
+
+        This keeps grasp->reach sequence deterministic by planning the reach
+        target (with grasp yaw hint) from the same pre-grasp snapshot.
+        """
+        reach_goal = self.queued_goals.get("reach")
+        if not isinstance(reach_goal, dict) or str(reach_goal.get("kind", "")) != "reach":
+            return
+
+        target_world = reach_goal.get("point_odom_xyz")
+        if not (isinstance(target_world, (list, tuple)) and len(target_world) >= 3):
+            resolved_xyz = self._resolve_goal_point_xyz_for_current_base(reach_goal)
+            if not (isinstance(resolved_xyz, (list, tuple)) and len(resolved_xyz) >= 3):
+                return
+            base_pose = self.ros_node.get_measured_base_pose_xytheta()
+            if not (isinstance(base_pose, (list, tuple)) and len(base_pose) >= 3):
+                return
+            target_world = self._base_point_to_odom_xyz(
+                (float(resolved_xyz[0]), float(resolved_xyz[1]), float(resolved_xyz[2])),
+                (float(base_pose[0]), float(base_pose[1]), float(base_pose[2])),
+            )
+
+        grasp_yaw = grasp_goal.get("grasp_yaw")
+        yaw_hint = float(grasp_yaw) if isinstance(grasp_yaw, (int, float)) else None
+        self._set_status(
+            "Sequence: precomputing reach target from current frame...",
+            "QLabel { color: blue; font-size: 10px; }",
+        )
+        plan = self.ros_node.plan_open_loop_grasp(
+            [float(target_world[0]), float(target_world[1]), float(target_world[2])],
+            pregrasp_distance=0.20,
+            lift_distance=IK_LIFT_DISTANCE_M,
+            wrist_yaw_target=yaw_hint,
+            wrist_pitch_target=float(np.deg2rad(GRASP_PITCH_DEG)),
+            wrist_roll_target=None,
+            timeout_s=25.0,
+        )
+        if not (isinstance(plan, dict) and bool(plan.get("ok", False))):
+            err = None
+            if isinstance(plan, dict):
+                err = plan.get("error")
+            print(f"[goal_sequence] reach precompute skipped: {err if err else 'planner failed'}")
+            return
+        grasp_joint = plan.get("grasp_joint")
+        if not (isinstance(grasp_joint, list) and len(grasp_joint) >= 6):
+            print("[goal_sequence] reach precompute skipped: invalid grasp_joint")
+            return
+
+        reach_goal["_precomputed_grasp_joint6"] = [float(v) for v in grasp_joint[:6]]
+        if yaw_hint is not None:
+            reach_goal["_precomputed_yaw_hint"] = float(yaw_hint)
+        reach_goal["_precomputed_world_xyz"] = [
+            float(target_world[0]),
+            float(target_world[1]),
+            float(target_world[2]),
+        ]
+        print(
+            "[goal_sequence] precomputed reach from grasp frame: "
+            f"target_world=({float(target_world[0]):+.3f}, {float(target_world[1]):+.3f}, {float(target_world[2]):+.3f}) "
+            f"joint6={reach_goal['_precomputed_grasp_joint6']}"
+        )
+
+    def add_reach_goal_at_pixel(self, px, py):
+        with self._action_lock:
+            if self._action_state != 'idle':
+                self._set_status("Add goals while idle (before starting sequence)", "QLabel { color: orange; font-size: 10px; }")
+                return
+        goal, err = self._prepare_reach_goal_from_pixel(px, py)
+        if err:
+            self._set_status(err, "QLabel { color: red; font-size: 10px; }")
+            return
+        self._store_queued_goal(goal)
+
+    def add_grasp_goal_at_pixel(self, px, py, segment=None):
+        with self._action_lock:
+            if self._action_state != 'idle':
+                self._set_status("Add goals while idle (before starting sequence)", "QLabel { color: orange; font-size: 10px; }")
+                return
+        goal, err = self._prepare_grasp_goal_from_pixel(px, py, segment=segment)
+        if err:
+            self._set_status(err, "QLabel { color: red; font-size: 10px; }")
+            return
+        self._store_queued_goal(goal)
+
+    def _start_prepared_goal(self, goal, preserve_existing_pre_action_state=False):
+        if goal is None:
+            return False
+        if not self._begin_action(goal["kind"]):
+            self._set_status("Another action is already running/paused", "QLabel { color: orange; font-size: 10px; }")
+            return False
+
+        resolved_xyz = self._resolve_goal_point_xyz_for_current_base(goal)
+        if resolved_xyz is None:
+            self._set_status("Invalid queued goal point", "QLabel { color: red; font-size: 10px; }")
+            self._set_action_state('idle')
+            return False
+        point_base = self._point_from_xyz(resolved_xyz)
+        kind = goal["kind"]
+        if kind == "grasp":
+            self._set_status("Executing queued grasp sequence...", "QLabel { color: blue; font-size: 10px; }")
+            if isinstance(goal.get("grasp_debug_info"), dict):
+                self._grasp_debug_info = dict(goal["grasp_debug_info"])
+            else:
+                self._grasp_debug_info = None
+        else:
+            self._set_status("Executing queued reach sequence...", "QLabel { color: blue; font-size: 10px; }")
+            self._grasp_debug_info = None
+
+        def run():
+            try:
+                if kind == "grasp":
+                    try:
+                        self._precompute_followup_reach_from_grasp_goal(goal)
+                    except Exception as pre_exc:
+                        print(f"[goal_sequence] reach precompute error: {pre_exc}")
+                kwargs = dict(
+                    point_base=point_base,
+                    mode=kind,
+                    object_top_z=goal.get("object_top_z"),
+                    preserve_existing_pre_action_state=bool(preserve_existing_pre_action_state),
+                )
+                goal_odom_xyz = goal.get("point_odom_xyz")
+                if isinstance(goal_odom_xyz, (list, tuple)) and len(goal_odom_xyz) >= 3:
+                    kwargs["target_world_xyz_override"] = (
+                        float(goal_odom_xyz[0]),
+                        float(goal_odom_xyz[1]),
+                        float(goal_odom_xyz[2]),
+                    )
+                if kind == "reach":
+                    kwargs["height_clearance"] = REACH_HEIGHT_CLEARANCE
+                    pre_joint6 = goal.get("_precomputed_grasp_joint6")
+                    if isinstance(pre_joint6, list) and len(pre_joint6) >= 6:
+                        kwargs["preplanned_grasp_joint6"] = [float(v) for v in pre_joint6[:6]]
+                    pre_yaw = goal.get("_precomputed_yaw_hint")
+                    if isinstance(pre_yaw, (int, float)):
+                        kwargs["grasp_yaw"] = float(pre_yaw)
+                else:
+                    kwargs["grasp_yaw"] = goal.get("grasp_yaw")
+                    kwargs["gripper_width"] = goal.get("gripper_width")
+                    kwargs["grasp_mask"] = goal.get("grasp_mask")
+                    kwargs["long_axis_angle"] = goal.get("long_axis_angle")
+                self._execute_approach(**kwargs)
+            except Exception as e:
+                print(f"{kind.capitalize()} error: {e}")
+                import traceback
+                traceback.print_exc()
+                self._set_status(f"{kind.capitalize()} failed: {str(e)}", "QLabel { color: red; font-size: 10px; }")
+            finally:
+                launch_next = False
+                if self._deferred_next_goal_start and self._goal_sequence_has_next():
+                    self._deferred_next_goal_start = False
+                    launch_next = True
+                with self._action_lock:
+                    st = self._action_state
+                if st == 'running':
+                    self._set_action_state('idle')
+                self._update_goal_queue_label()
+                self._update_next_goal_button_state()
+                if launch_next:
+                    self._start_next_queued_goal()
+
+        from threading import Thread
+        Thread(target=run, daemon=True).start()
+        return True
+
+    def _start_next_queued_goal(self):
+        goals = self._goal_sequence_order()
+        if self.queued_goal_cursor >= len(goals):
+            self._set_status("No queued goal remaining", "QLabel { color: gray; font-size: 10px; }")
+            self._update_next_goal_button_state()
+            return False
+        goal = goals[self.queued_goal_cursor]
+        preserve = bool(self.queued_sequence_started and self._pre_action_state is not None)
+        if preserve:
+            self._sync_pre_action_rotation_from_odom()
+            try:
+                dbg_base_x = float(self._pre_action_state.get("base_x", float("nan")))
+                dbg_pose = self._pre_action_state.get("base_pose_xytheta_start")
+                print(
+                    "[goal_sequence] reusing saved return state "
+                    f"for goal#{self.queued_goal_cursor + 1} "
+                    f"(base_x={dbg_base_x:+.3f}, base_pose_start={dbg_pose})"
+                )
+            except Exception:
+                pass
+        else:
+            print(
+                "[goal_sequence] starting new return state "
+                f"for goal#{self.queued_goal_cursor + 1}"
+            )
+        if not self._start_prepared_goal(goal, preserve_existing_pre_action_state=preserve):
+            return False
+        self.queued_sequence_started = True
+        self.queued_goal_cursor += 1
+        self._update_goal_queue_label()
+        self._update_next_goal_button_state()
+        return True
+
+    def go_to_next_goal(self):
+        """Run next queued goal, or skip current scripted action and continue sequence."""
+        goals = self._goal_sequence_order()
+        if not goals:
+            self._set_status("No queued goals. Use right-click: Add Grasp Goal / Add Reach Goal.",
+                             "QLabel { color: orange; font-size: 10px; }")
+            return
+        with self._action_lock:
+            st = self._action_state
+
+        # If a scripted action is active and another queued goal exists, abort current
+        # action and continue with the next queued goal.
+        if st in ('running', 'paused', 'awaiting_confirm') and self._goal_sequence_has_next():
+            self._deferred_next_goal_start = True
+            self._skip_to_next_goal_requested = True
+            with self._action_lock:
+                self._action_abort_requested = True
+            self._set_action_state('running')  # release paused/confirm wait loops
+            self._set_status("Skipping current action. Will move to next queued goal...",
+                             "QLabel { color: orange; font-size: 10px; }")
+            self._update_next_goal_button_state()
+            return
+
+        if st != 'idle':
+            self._set_status("Wait for current action to finish or pause it first",
+                             "QLabel { color: orange; font-size: 10px; }")
+            return
+
+        if not self._start_next_queued_goal():
+            self._update_next_goal_button_state()
+
+    def _reach_to_pixel(self, px, py):
+        """Reach 10cm above the 3D point at the given pixel."""
+        if not self._begin_action('reach'):
+            self._set_status("Another action is already running/paused",
+                             "QLabel { color: orange; font-size: 10px; }")
+            return
+
+        point_base, depth = self._get_3d_point_at_pixel(px, py)
+        if point_base is None:
+            self._set_action_state('idle')
+            self._set_status("No valid depth at clicked point", "QLabel { color: red; }")
+            return
+
+        # Find segment mask at this pixel for collision-aware height
+        object_top_z = None
+        if self.segments:
+            for seg in self.segments:
+                if py < seg['mask'].shape[0] and px < seg['mask'].shape[1]:
+                    if seg['mask'][py, px] > 0:
+                        object_top_z = self._compute_object_top_z(seg['mask'])
+                        break
+
+        print(f"\n{'='*60}")
+        print(f"REACH TO PIXEL ({px}, {py})")
+        if object_top_z is not None:
+            print(f"  Object top Z: {object_top_z:.3f}m (base_link)")
+        print(f"{'='*60}")
+        self._set_status("Reaching to point...", "QLabel { color: blue; font-size: 10px; }")
+
+        def run():
+            try:
+                self._execute_approach(point_base, mode='reach', height_clearance=REACH_HEIGHT_CLEARANCE,
+                                       object_top_z=object_top_z)
+            except Exception as e:
+                print(f"Reach error: {e}")
+                import traceback
+                traceback.print_exc()
+                self._set_status(f"Reach failed: {str(e)}", "QLabel { color: red; font-size: 10px; }")
+            finally:
+                with self._action_lock:
+                    st = self._action_state
+                if st == 'running':
+                    self._set_action_state('idle')
+
+        from threading import Thread
+        Thread(target=run, daemon=True).start()
+
+    def _grasp_at_pixel(self, px, py, segment=None):
+        """Grasp the object at the given pixel with orientation + width estimation.
+        segment: optional segment dict with 'mask'. If None, looks up from self.segments."""
+        if not self._begin_action('grasp'):
+            self._set_status("Another action is already running/paused",
+                             "QLabel { color: orange; font-size: 10px; }")
+            return
+
+        point_base, depth = self._get_3d_point_at_pixel(px, py)
+        if point_base is None:
+            self._set_action_state('idle')
+            self._set_status("No valid depth at clicked point", "QLabel { color: red; }")
+            return
+        if depth < 0.1 or depth > 2.0:
+            self._set_action_state('idle')
+            self._set_status(f"Object too far or invalid depth: {depth:.2f}m", "QLabel { color: red; }")
+            return
+
+        # Find the segment mask at this pixel
+        mask = None
+        if segment is not None:
+            mask = segment['mask']
+        elif self.segments:
+            for seg in self.segments:
+                if py < seg['mask'].shape[0] and px < seg['mask'].shape[1]:
+                    if seg['mask'][py, px] > 0:
+                        mask = seg['mask']
+                        break
+        # Fallback: use currently selected segment mask if pixel lookup missed
+        # due rounding/component split, so grasp keeps top-surface safety.
+        if mask is None and self.selected_segment is not None and 'mask' in self.selected_segment:
+            sel_mask = self.selected_segment['mask']
+            if py < sel_mask.shape[0] and px < sel_mask.shape[1]:
+                mask = sel_mask
+
+        # Compute optimal grasp orientation and gripper width
+        gripper_width = None
+        rect_info = None
+        object_top_z = None
+        long_axis_angle = None
+        grasp_yaw = None
+        grasp_shape_info = None
+        if mask is not None:
+            grasp_shape_info = self._analyze_segment_geometry(mask)
+            grasp_yaw, rect_info = self._compute_grasp_orientation(mask, px, py)
+            # For non-horizontal/vertical-like surfaces, orientation from full 3D
+            # surface PCA is more stable than top-surface rectangle orientation.
+            if isinstance(grasp_shape_info, dict):
+                axis_angle = grasp_shape_info.get("axis_angle_xy_rad")
+                strategy = str(grasp_shape_info.get("approach_strategy", "lift_standoff"))
+                if axis_angle is not None and strategy == "reach_standoff":
+                    grasp_yaw = self._resolve_wrist_yaw_candidate(float(axis_angle) + float(np.pi / 2.0))
+                    print(
+                        "  Using geometry-PCA yaw for vertical-like object: "
+                        f"axis={np.degrees(float(axis_angle)):.1f}deg, yaw={np.degrees(float(grasp_yaw)):.1f}deg"
+                    )
+            gripper_width = self._estimate_gripper_width(mask, px, py, depth, rect_info)
+            object_top_z = self._compute_object_top_z(mask)
+            if rect_info is not None and rect_info.get('top_z_max') is not None:
+                top_from_grasp_fit = float(rect_info['top_z_max'])
+                if object_top_z is None:
+                    object_top_z = top_from_grasp_fit
+                else:
+                    object_top_z = max(float(object_top_z), top_from_grasp_fit)
+            # Store for debug overlay drawing
+            self._grasp_debug_info = rect_info
+            # Extract long axis angle (radians) for reverse IK approach
+            if rect_info is not None:
+                import math as _m
+                long_axis_angle = _m.radians(rect_info['long_axis_angle_deg'])
+                print(f"  Long axis angle: {rect_info['long_axis_angle_deg']:.1f}° from +X in base_link")
+            if isinstance(grasp_shape_info, dict):
+                print(
+                    "  Geometry class: "
+                    f"{grasp_shape_info.get('geometry_class')} "
+                    f"(strategy={grasp_shape_info.get('approach_strategy')})"
+                )
+
+        # Safety: avoid grasping using only raw click depth (can be below object/table).
+        if mask is None or object_top_z is None:
+            self._set_action_state('idle')
+            self._set_status(
+                "Could not estimate object top surface. Re-segment and reselect before grasp.",
+                "QLabel { color: red; font-size: 10px; }"
+            )
+            print("  ABORT grasp: missing mask/top-surface estimate; raw click depth is unsafe for final Z.")
+            return
+
+        print(f"\n{'='*60}")
+        print(f"GRASP AT PIXEL ({px}, {py}) — orientation-aware")
+        if object_top_z is not None:
+            print(f"  Object top Z: {object_top_z:.3f}m (base_link)")
+        print(f"{'='*60}")
+        self._set_status("Executing smart grasp sequence...", "QLabel { color: blue; font-size: 10px; }")
+
+        point_base_exec = point_base
+        if isinstance(rect_info, dict):
+            center_xy = rect_info.get("center")
+            plane_z = rect_info.get("plane_z")
+            target_x = float(point_base.point.x)
+            target_y = float(point_base.point.y)
+            target_z = float(point_base.point.z)
+            if isinstance(center_xy, (list, tuple)) and len(center_xy) >= 2:
+                try:
+                    cx = float(center_xy[0])
+                    cy = float(center_xy[1])
+                    if math.isfinite(cx) and math.isfinite(cy):
+                        target_x = cx
+                        target_y = cy
+                except (TypeError, ValueError):
+                    pass
+            if isinstance(plane_z, (int, float)) and math.isfinite(float(plane_z)):
+                target_z = float(plane_z)
+            if isinstance(object_top_z, (int, float)) and math.isfinite(float(object_top_z)):
+                target_z = float(float(object_top_z) - float(GRASP_TARGET_Z_OFFSET_M))
+            point_base_exec = self._point_from_xyz((target_x, target_y, target_z))
+            print(
+                f"  IK target from top-surface centroid (z-{GRASP_TARGET_Z_OFFSET_M*100:.0f}cm): "
+                f"x={target_x:+.3f}, y={target_y:+.3f}, z={target_z:+.3f} (base_link)"
+            )
+
+        def run():
+            try:
+                shape_info_for_ik = (
+                    grasp_shape_info if bool(DIRECT_GRASP_USE_GEOMETRY_STRATEGY) else None
+                )
+                self._execute_approach(point_base_exec, mode='grasp',
+                                       grasp_yaw=grasp_yaw,
+                                       gripper_width=gripper_width,
+                                       object_top_z=object_top_z,
+                                       grasp_mask=mask,
+                                       long_axis_angle=long_axis_angle,
+                                       grasp_shape_info=shape_info_for_ik)
+            except Exception as e:
+                print(f"Grasp error: {e}")
+                import traceback
+                traceback.print_exc()
+                self._set_status(f"Grasp failed: {str(e)}", "QLabel { color: red; font-size: 10px; }")
+            finally:
+                with self._action_lock:
+                    st = self._action_state
+                # Keep awaiting_post_grasp state until user returns.
+                if st == 'running':
+                    self._set_action_state('idle')
+
+        from threading import Thread
+        Thread(target=run, daemon=True).start()
+
+    def _preview_grasp_at_pixel(self, px, py, segment=None):
+        """Compute/draw grasp debug overlay at click point without robot motion."""
+        point_base, depth = self._get_3d_point_at_pixel(px, py)
+        if point_base is None or depth is None:
+            self._set_status("See Grasp: no valid depth at clicked point", "QLabel { color: red; }")
+            return
+
+        mask = None
+        if segment is not None and isinstance(segment, dict):
+            mask = segment.get('mask')
+        if mask is None and self.segments:
+            for seg in self.segments:
+                if py < seg['mask'].shape[0] and px < seg['mask'].shape[1] and seg['mask'][py, px] > 0:
+                    mask = seg['mask']
+                    break
+        if mask is None and self.selected_segment is not None and 'mask' in self.selected_segment:
+            sel_mask = self.selected_segment['mask']
+            if py < sel_mask.shape[0] and px < sel_mask.shape[1]:
+                mask = sel_mask
+
+        if mask is None:
+            self._set_status("See Grasp: click on a segmented object", "QLabel { color: orange; }")
+            return
+
+        grasp_shape_info = self._analyze_segment_geometry(mask)
+        grasp_yaw, rect_info = self._compute_grasp_orientation(mask, px, py)
+        if isinstance(grasp_shape_info, dict):
+            axis_angle = grasp_shape_info.get("axis_angle_xy_rad")
+            strategy = str(grasp_shape_info.get("approach_strategy", "lift_standoff"))
+            if axis_angle is not None and strategy == "reach_standoff":
+                grasp_yaw = self._resolve_wrist_yaw_candidate(float(axis_angle) + float(np.pi / 2.0))
+
+        gripper_width = self._estimate_gripper_width(mask, px, py, depth, rect_info)
+        object_top_z = self._compute_object_top_z(mask)
+        self._grasp_debug_info = rect_info
+        self.update_camera_displays()
+
+        geom = ""
+        if isinstance(grasp_shape_info, dict):
+            geom = (
+                f", class={grasp_shape_info.get('geometry_class')}"
+                f", strategy={grasp_shape_info.get('approach_strategy')}"
+            )
+        msg = (
+            "See Grasp: "
+            f"yaw={np.degrees(float(grasp_yaw)):.1f}deg, "
+            f"gripper={float(gripper_width):.3f}, "
+            f"top_z={(float(object_top_z) if object_top_z is not None else float('nan')):.3f}m"
+            f"{geom}"
+        )
+        print(msg)
+        self._set_status(msg, "QLabel { color: #1e88e5; font-size: 10px; }")
+
+    def _get_current_base_yaw(self):
+        """Yaw from current odom orientation (radians), or None if unavailable."""
+        if self.ros_node.odom is None:
+            return None
+        q = self.ros_node.odom.pose.pose.orientation
+        import math
+        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        return float(math.atan2(siny_cosp, cosy_cosp))
+
+    def _sync_pre_action_rotation_from_odom(self):
+        """Update saved rotation_applied from odom yaw if start yaw is available."""
+        if self._pre_action_state is None:
+            return
+        if 'base_yaw_start' not in self._pre_action_state:
+            return
+        yaw_now = self._get_current_base_yaw()
+        if yaw_now is None:
+            return
+        import math
+        yaw_start = float(self._pre_action_state['base_yaw_start'])
+        dyaw = math.atan2(math.sin(yaw_now - yaw_start), math.cos(yaw_now - yaw_start))
+        self._pre_action_state['rotation_applied'] = float(dyaw)
+
+    def _consume_skip_to_next_goal_request(self):
+        if self._skip_to_next_goal_requested:
+            self._skip_to_next_goal_requested = False
+            return True
+        return False
+
+    def return_to_start(self):
+        """Return arm and base to the position saved before the last reach/grasp."""
+        with self._action_lock:
+            st = self._action_state
+
+        # If an action is in progress, request abort and let action thread
+        # trigger the return safely.
+        if st in ('running', 'paused', 'awaiting_confirm', 'awaiting_post_grasp'):
+            with self._action_lock:
+                self._action_abort_requested = True
+            self._set_action_state('running')  # release pause/confirm waits
+            self._set_status("Abort requested... returning to start",
+                             "QLabel { color: orange; font-size: 10px; }")
+            self._set_return_enabled(False)
+            return
+
+        if self._pre_action_state is None:
+            self._set_status("No saved position to return to", "QLabel { color: red; }")
+            return
+
+        self._sync_pre_action_rotation_from_odom()
+        state = self._pre_action_state
+        self._set_return_enabled(False)
+        self._set_status("Returning to start position...", "QLabel { color: blue; font-size: 10px; }")
+
+        print(f"\n{'='*60}")
+        print(f"RETURN TO START")
+        print(f"{'='*60}")
+
+        def run():
+            try:
+                import time
+                import math
+
+                def _stage_sleep(duration_s):
+                    time.sleep(min(float(SCRIPT_STAGE_WAIT_CAP_S), max(0.0, float(duration_s))))
+
+                def _restore_manip_base_x(target_base_x: float, attempts: int = 4, tol_m: float = 0.008) -> None:
+                    """Best-effort manip base_x convergence with verification/retry."""
+                    target = float(target_base_x)
+                    for attempt in range(int(max(1, attempts))):
+                        cur_joint = self._current_manip_joint6()
+                        if not (isinstance(cur_joint, list) and len(cur_joint) >= 6):
+                            return
+                        cur_joint = [float(v) for v in cur_joint[:6]]
+                        err = float(target - cur_joint[0])
+                        if abs(err) <= float(tol_m):
+                            return
+                        print(
+                            f"Refining base_x (attempt {attempt + 1}/{attempts}): "
+                            f"current={cur_joint[0]:+.3f}, target={target:+.3f}, err={err:+.3f}"
+                        )
+                        cur_joint[0] = float(target)
+                        self._execute_arm_to_chunked(
+                            cur_joint[:6],
+                            gripper=None,
+                            timeout_s=8.0,
+                            reliable=False,
+                        )
+                        _stage_sleep(0.25)
+
+                rotation = state['rotation_applied']
+                saved_base_pose = state.get('base_pose_xytheta_start')
+                LIFT_MAX = self.ros_node.JOINT_LIMITS[1][1]
+                RETRACT_EXT = 0.0
+                saved_base_x = float(state.get('base_x', 0.0))
+                saved_wrist_yaw = float(state.get('wrist_yaw', 0.0))
+                saved_wrist_pitch = float(state.get('wrist_pitch', 0.0))
+                saved_wrist_roll = float(state.get('wrist_roll', 0.0))
+                saved_lift = float(state.get('lift', 0.85))
+                saved_arm = float(state.get('arm_ext', 0.0))
+                # Preserve user-adjusted gripper target (if any) across return flow.
+                target_q_before = self.ros_node.get_target_qpos()
+                if isinstance(target_q_before, list) and len(target_q_before) >= 8:
+                    preserved_gripper_target = float(target_q_before[7])
+                else:
+                    preserved_gripper_target = None
+
+                # Prevent background command stream from reopening gripper or overwriting wrist/base_x.
+                self._freeze_streaming_commands_to_current_state()
+                if preserved_gripper_target is not None:
+                    with self.ros_node._lock:
+                        if self.ros_node.qpos is not None and len(self.ros_node.qpos) >= 8:
+                            self.ros_node.qpos[7] = float(
+                                np.clip(
+                                    preserved_gripper_target,
+                                    float(self.ros_node.JOINT_LIMITS[7][0]),
+                                    float(self.ros_node.JOINT_LIMITS[7][1]),
+                                )
+                            )
+                        if self.ros_node.published_qpos is not None and len(self.ros_node.published_qpos) >= 8:
+                            self.ros_node.published_qpos[7] = float(self.ros_node.qpos[7])
+
+                # Simplified return policy:
+                # Retract arm + set return safe lift, keep base untouched.
+                safe_lift = float(
+                    np.clip(
+                        float(RETURN_SAFE_LIFT_M),
+                        float(self.ros_node.JOINT_LIMITS[1][0]),
+                        float(self.ros_node.JOINT_LIMITS[1][1]),
+                    )
+                )
+                print(
+                    "Safe return: retract arm and lift only "
+                    f"(arm={RETRACT_EXT:.3f}, lift={safe_lift:.3f}); base unchanged."
+                )
+                cur_joint = self._current_manip_joint6()
+                if isinstance(cur_joint, list) and len(cur_joint) >= 6:
+                    cur_joint = [float(v) for v in cur_joint[:6]]
+                    cur_joint[1] = float(safe_lift)
+                    cur_joint[2] = float(RETRACT_EXT)
+                    self._execute_arm_to_chunked(
+                        cur_joint[:6],
+                        gripper=None,
+                        timeout_s=10.0,
+                        reliable=False,
+                    )
+                _stage_sleep(0.6)
+                # Also restore startup wrist yaw target (default init is -1.2 rad).
+                default_wrist_yaw = -1.2
+                try:
+                    if isinstance(DEFAULT_INIT_CMD_QPOS8, (list, tuple)) and len(DEFAULT_INIT_CMD_QPOS8) >= 3:
+                        default_wrist_yaw = float(DEFAULT_INIT_CMD_QPOS8[2])
+                except Exception:
+                    default_wrist_yaw = -1.2
+                default_wrist_yaw = float(
+                    np.clip(
+                        float(default_wrist_yaw),
+                        float(self.ros_node.JOINT_LIMITS[2][0]),
+                        float(self.ros_node.JOINT_LIMITS[2][1]),
+                    )
+                )
+                cur_joint_yaw = self._current_manip_joint6()
+                if isinstance(cur_joint_yaw, list) and len(cur_joint_yaw) >= 6:
+                    cur_joint_yaw = [float(v) for v in cur_joint_yaw[:6]]
+                    cur_joint_yaw[3] = float(default_wrist_yaw)
+                    print(f"Safe return: restoring startup wrist yaw={default_wrist_yaw:+.3f} rad")
+                    self._execute_arm_to_chunked(
+                        cur_joint_yaw[:6],
+                        gripper=None,
+                        timeout_s=8.0,
+                        reliable=False,
+                    )
+                    _stage_sleep(0.25)
+                # Final stage: restore startup/default non-base pose
+                # (includes lift=0.35 from DEFAULT_INIT_CMD_QPOS8).
+                q8_home = list(DEFAULT_INIT_CMD_QPOS8) if isinstance(DEFAULT_INIT_CMD_QPOS8, (list, tuple)) else []
+                if len(q8_home) < 8:
+                    q8_home = q8_home + [0.0] * (8 - len(q8_home))
+                home_joint6 = [
+                    0.0,                 # manip base_x
+                    float(q8_home[1]),   # lift
+                    float(q8_home[0]),   # arm extension
+                    float(q8_home[2]),   # wrist_yaw
+                    float(q8_home[3]),   # wrist_pitch
+                    float(q8_home[4]),   # wrist_roll
+                ]
+                home_gripper = float(q8_home[7])
+                home_head = [float(q8_home[5]), float(q8_home[6])]
+                print(
+                    "Safe return: restoring startup joint pose "
+                    f"(lift={home_joint6[1]:.3f}, arm={home_joint6[2]:.3f}, yaw={home_joint6[3]:+.3f})."
+                )
+                self._execute_arm_to_chunked(
+                    home_joint6,
+                    gripper=home_gripper,
+                    head=home_head,
+                    timeout_s=12.0,
+                    reliable=False,
+                )
+                _stage_sleep(0.25)
+                self._pre_action_state = None
+                self.queued_sequence_started = False
+                self.ros_node.sync_command_targets_to_actual()
+                print("Safe return completed. Base unchanged.")
+                self._set_status(
+                    f"Return complete: safe move lift={safe_lift:.2f}, then startup lift={home_joint6[1]:.2f}. Base unchanged; move base manually.",
+                    "QLabel { color: green; font-size: 10px; }",
+                )
+                self._set_action_state('idle')
+                self._update_goal_queue_label()
+                self._update_next_goal_button_state()
+                return
+
+                # Step 3: Optional nav base pose correction.
+                # Disabled by default because move_base_relative() can still rotate
+                # due planner behavior. For deterministic linear return use manip base_x only.
+                if bool(RETURN_USE_NAV_BASE_POSE_CORRECTION):
+                    if isinstance(saved_base_pose, list) and len(saved_base_pose) >= 3:
+                        sx, sy = float(saved_base_pose[0]), float(saved_base_pose[1])
+                        for attempt in range(3):
+                            cur_pose = self.ros_node.get_measured_base_pose_xytheta()
+                            if not (isinstance(cur_pose, list) and len(cur_pose) >= 3):
+                                break
+                            cx, cy, ct = float(cur_pose[0]), float(cur_pose[1]), float(cur_pose[2])
+                            wx = sx - cx
+                            wy = sy - cy
+                            dx_rel = math.cos(ct) * wx + math.sin(ct) * wy
+                            if abs(dx_rel) <= 0.008:
+                                break
+                            print(
+                                "Restoring base linear x "
+                                f"(attempt {attempt + 1}/3, dx={dx_rel:+.3f}m)..."
+                            )
+                            ok_pose = self.ros_node.move_base_relative(
+                                dx=float(dx_rel),
+                                dy=0.0,
+                                dtheta=0.0,
+                                blocking=True,
+                                timeout_s=max(2.0, 3.0 + 8.0 * abs(dx_rel)),
+                            )
+                            if not ok_pose:
+                                print("  WARNING: bridge move_base_relative x-only restore failed")
+                            _stage_sleep(0.60)
+                else:
+                    # User-preferred return behavior: one direct textbox-style
+                    # base translation command (no chunk/retry loop).
+                    if isinstance(saved_base_pose, list) and len(saved_base_pose) >= 3:
+                        cur_pose = self.ros_node.get_measured_base_pose_xytheta()
+                        if isinstance(cur_pose, list) and len(cur_pose) >= 3:
+                            sx, sy = float(saved_base_pose[0]), float(saved_base_pose[1])
+                            cx, cy, ct = float(cur_pose[0]), float(cur_pose[1]), float(cur_pose[2])
+                            wx = sx - cx
+                            wy = sy - cy
+                            dx_rel = math.cos(ct) * wx + math.sin(ct) * wy
+                            if abs(dx_rel) > 0.008:
+                                print(
+                                    "Return base single-shot "
+                                    f"(dx={dx_rel:+.3f}m, textbox-style)"
+                                )
+                                ok_pose = self.ros_node.move_base_relative(
+                                    dx=float(dx_rel),
+                                    dy=0.0,
+                                    dtheta=0.0,
+                                    blocking=True,
+                                    timeout_s=max(2.0, 3.0 + 8.0 * abs(dx_rel)),
+                                )
+                                if not ok_pose:
+                                    print("  WARNING: single-shot base return command failed")
+                                _stage_sleep(0.25)
+                            else:
+                                print("Return base single-shot skipped (already within 8mm).")
+                    else:
+                        print("Return base single-shot skipped (missing saved base pose).")
+
+                # Step 4: Restore base_x + wrist orientation (keep gripper closed)
+                print(
+                    "Restoring base_x/wrist "
+                    f"(base_x={saved_base_x:.3f}, yaw={saved_wrist_yaw:.3f}, "
+                    f"pitch={saved_wrist_pitch:.3f}, roll={saved_wrist_roll:.3f})"
+                )
+                restore_joint = [
+                    float(saved_base_x),
+                    float(LIFT_MAX),
+                    float(RETRACT_EXT),
+                    float(saved_wrist_yaw),
+                    float(saved_wrist_pitch),
+                    float(saved_wrist_roll),
+                ]
+                self._execute_arm_to_chunked(
+                    restore_joint[:6],
+                    gripper=None,
+                    timeout_s=10.0,
+                    reliable=False,
+                )
+                _stage_sleep(0.5)
+
+                # Step 5: Restore head pan/tilt
+                print(f"Restoring head pan={state['head_pan']:.3f}, tilt={state['head_tilt']:.3f}")
+                self._execute_arm_to_chunked(
+                    restore_joint[:6],
+                    gripper=None,
+                    head=[float(state['head_pan']), float(state['head_tilt'])],
+                    timeout_s=8.0,
+                    reliable=False,
+                )
+                _stage_sleep(1.0)
+
+                # Step 6: Return to saved start arm/lift/base_x and keep closed gripper.
+                print(
+                    "Restoring saved arm/lift/base_x "
+                    f"(base_x={saved_base_x:.3f}, lift={saved_lift:.3f}, arm={saved_arm:.3f})..."
+                )
+                final_joint = [
+                    float(saved_base_x),
+                    float(saved_lift),
+                    float(saved_arm),
+                    float(saved_wrist_yaw),
+                    float(saved_wrist_pitch),
+                    float(saved_wrist_roll),
+                ]
+                self._execute_arm_to_chunked(
+                    final_joint[:6],
+                    gripper=None,
+                    head=[float(state['head_pan']), float(state['head_tilt'])],
+                    timeout_s=10.0,
+                    reliable=False,
+                )
+                _stage_sleep(1.5)
+
+                # Make manip base_x fully converge to start value, especially when
+                # returning from pre-grasp pause/abort.
+                _restore_manip_base_x(saved_base_x, attempts=4, tol_m=0.008)
+
+                # Final nav x refine (same toggle as Step-3).
+                if bool(RETURN_USE_NAV_BASE_POSE_CORRECTION):
+                    if isinstance(saved_base_pose, list) and len(saved_base_pose) >= 3:
+                        cur_pose = self.ros_node.get_measured_base_pose_xytheta()
+                        if isinstance(cur_pose, list) and len(cur_pose) >= 3:
+                            cx, cy, ct = float(cur_pose[0]), float(cur_pose[1]), float(cur_pose[2])
+                            sx, sy = float(saved_base_pose[0]), float(saved_base_pose[1])
+                            wx = sx - cx
+                            wy = sy - cy
+                            dx_rel = math.cos(ct) * wx + math.sin(ct) * wy
+                            if abs(dx_rel) > 0.01:
+                                print(
+                                    "Final base x refine "
+                                    f"(dx={dx_rel:+.3f}m)"
+                                )
+                                self.ros_node.move_base_relative(
+                                    dx=float(dx_rel),
+                                    dy=0.0,
+                                    dtheta=0.0,
+                                    blocking=True,
+                                    timeout_s=max(2.0, 3.0 + 6.0 * abs(dx_rel)),
+                                )
+                                _stage_sleep(0.25)
+
+                self._pre_action_state = None
+                self.queued_sequence_started = False
+                self.ros_node.sync_command_targets_to_actual()
+                print("Return completed!")
+                self._set_status("Returned to start position", "QLabel { color: green; font-size: 10px; }")
+                self._set_action_state('idle')
+                self._update_goal_queue_label()
+                self._update_next_goal_button_state()
+
+            except Exception as e:
+                print(f"Return error: {e}")
+                import traceback
+                traceback.print_exc()
+                self._set_status(f"Return failed: {str(e)}", "QLabel { color: red; font-size: 10px; }")
+                self._set_return_enabled(True)
+                self._set_action_state('idle')
+
+        from threading import Thread
+        Thread(target=run, daemon=True).start()
+
+    def closeEvent(self, event):
+        """Handle window close"""
+        print("Closing application...", flush=True)
+        if self.is_recording_demo:
+            self.stop_demo_recording()
+        self.control_timer.stop()
+        if hasattr(self, "device_timer"):
+            self.device_timer.stop()
+        if hasattr(self, "device_bridge"):
+            try:
+                self.device_bridge.stop()
+            except Exception:
+                pass
+        self.robot_controller.stop()
+        event.accept()
+
+
+class BridgeGoalQueueUI(RobotTeleopUI):
+    """Bridge wrapper for queued-goal UX: explicit execute, remove, clear, abort."""
+
+    # Defensive compatibility methods in case of inheritance/path skew.
+    def _set_manual_gripper_override(self, value: float | None) -> None:
+        setter = getattr(super(), "_set_manual_gripper_override", None)
+        if callable(setter):
+            setter(value)
+            return
+        if value is None or not isinstance(value, (int, float)):
+            self._manual_gripper_override = None
+            return
+        try:
+            v = float(value)
+            if not math.isfinite(v):
+                self._manual_gripper_override = None
+                return
+        except (TypeError, ValueError):
+            self._manual_gripper_override = None
+            return
+        lo, hi = self.ros_node.JOINT_LIMITS[7]
+        self._manual_gripper_override = float(np.clip(v, lo, hi))
+
+    def _get_manual_gripper_target(self, fallback: float | None = None) -> float | None:
+        getter = getattr(super(), "_get_manual_gripper_target", None)
+        if callable(getter):
+            return getter(fallback)
+        if self._manual_gripper_override is not None:
+            return float(self._manual_gripper_override)
+        target = self.ros_node.get_target_qpos()
+        if isinstance(target, list) and len(target) >= 8:
+            try:
+                v = float(target[7])
+                if math.isfinite(v):
+                    lo, hi = self.ros_node.JOINT_LIMITS[7]
+                    return float(np.clip(v, lo, hi))
+            except (TypeError, ValueError):
+                pass
+        actual = self.ros_node.get_actual_qpos()
+        if isinstance(actual, list) and len(actual) >= 8:
+            try:
+                v = float(actual[7])
+                if math.isfinite(v):
+                    lo, hi = self.ros_node.JOINT_LIMITS[7]
+                    return float(np.clip(v, lo, hi))
+            except (TypeError, ValueError):
+                pass
+        return None if fallback is None else float(fallback)
+
+    def adjust_gripper_step(self, direction):
+        grip_min, grip_max = self.ros_node.JOINT_LIMITS[7]
+        current = None
+        candidates = [
+            getattr(self, "_get_manual_gripper_target", None),
+            getattr(super(), "_get_manual_gripper_target", None),
+        ]
+        for getter in candidates:
+            if callable(getter):
+                try:
+                    current = getter(float(self.ros_node.JOINT_LIMITS[7][1]))
+                    break
+                except Exception:
+                    current = None
+        if current is None:
+            current = self.ros_node.get_target_qpos()
+            if isinstance(current, list) and len(current) >= 8:
+                try:
+                    current = float(current[7])
+                except (TypeError, ValueError):
+                    current = float(self.ros_node.JOINT_LIMITS[7][1])
+            else:
+                current = float(self.ros_node.JOINT_LIMITS[7][1])
+
+        delta = self.gripper_step if direction > 0 else -self.gripper_step
+        target = max(grip_min, min(grip_max, float(current) + delta))
+        self.set_gripper(target)
+        self.status_label.setText(
+            f"Gripper -> {target:.3f} (step {self.gripper_step:.3f})"
+        )
+        self.status_label.setStyleSheet("QLabel { color: blue; font-size: 10px; }")
+
+    def create_object_list(self):
+        widget = super().create_object_list()
+        layout = widget.layout()
+        if layout is None:
+            return widget
+
+        if hasattr(self, "next_goal_button"):
+            self.next_goal_button.setText("Next Goal (Manual)")
+            self.next_goal_button.setToolTip(
+                "Manually run/skip one queued goal. Use Execute Goals for full queued run."
+            )
+
+        self.execute_goals_button = QPushButton("Execute Goals")
+        self.execute_goals_button.setMinimumHeight(35)
+        self.execute_goals_button.clicked.connect(self.execute_all_queued_goals)
+        layout.addWidget(self.execute_goals_button)
+
+        self.abort_goals_button = QPushButton("Abort + Clear Goals")
+        self.abort_goals_button.setMinimumHeight(35)
+        self.abort_goals_button.clicked.connect(self.abort_and_clear_goals)
+        layout.addWidget(self.abort_goals_button)
+
+        self.goal_list_widget = QListWidget()
+        self.goal_list_widget.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
+        self.goal_list_widget.setMinimumHeight(80)
+        self.goal_list_widget.setMaximumHeight(130)
+        self.goal_list_widget.itemSelectionChanged.connect(self._on_goal_selection_changed)
+        layout.addWidget(self.goal_list_widget)
+
+        row = QHBoxLayout()
+        self.remove_goal_button = QPushButton("Remove Selected Goal")
+        self.remove_goal_button.clicked.connect(self.remove_selected_goal)
+        row.addWidget(self.remove_goal_button)
+        self.clear_goals_button = QPushButton("Clear Goals")
+        self.clear_goals_button.clicked.connect(self.clear_queued_goals)
+        row.addWidget(self.clear_goals_button)
+        layout.addLayout(row)
+
+        self._update_goal_queue_label()
+        self._update_next_goal_button_state()
+        self._on_goal_selection_changed()
+        return widget
+
+    def _pixel_from_event(self, event):
+        """Map click position on scaled QLabel to image pixel (handles letterboxing)."""
+        if self.head_rgb is None or not hasattr(self, "head_display"):
+            return None, None
+
+        disp = self.head_display
+        img_h, img_w = self.head_rgb.shape[:2]
+        if img_h <= 0 or img_w <= 0:
+            return None, None
+        w = max(1, int(disp.width()))
+        h = max(1, int(disp.height()))
+
+        scale = min(float(w) / float(img_w), float(h) / float(img_h))
+        shown_w = float(img_w) * scale
+        shown_h = float(img_h) * scale
+        x_off = (float(w) - shown_w) * 0.5
+        y_off = (float(h) - shown_h) * 0.5
+
+        ex = float(event.pos().x())
+        ey = float(event.pos().y())
+        if ex < x_off or ex >= (x_off + shown_w) or ey < y_off or ey >= (y_off + shown_h):
+            return None, None
+
+        px = int((ex - x_off) / scale)
+        py = int((ey - y_off) / scale)
+        px = int(np.clip(px, 0, img_w - 1))
+        py = int(np.clip(py, 0, img_h - 1))
+        return px, py
+
+    def _on_goal_selection_changed(self):
+        if not hasattr(self, "remove_goal_button"):
+            return
+        has_sel = hasattr(self, "goal_list_widget") and (self.goal_list_widget.currentItem() is not None)
+        self.remove_goal_button.setEnabled(bool(has_sel))
+
+    def _update_goal_queue_label(self):
+        super()._update_goal_queue_label()
+        if not hasattr(self, "goal_list_widget"):
+            return
+        self.goal_list_widget.clear()
+        goals = self._goal_sequence_order()
+        for idx, goal in enumerate(goals):
+            kind = str(goal.get("kind", "?"))
+            px = goal.get("px")
+            py = goal.get("py")
+            marker = "-> " if idx == self.queued_goal_cursor and self._goal_sequence_has_next() else "   "
+            item = QListWidgetItem(f"{marker}{idx + 1}. {kind} ({px}, {py})")
+            item.setData(Qt.ItemDataRole.UserRole, kind)
+            self.goal_list_widget.addItem(item)
+        self._on_goal_selection_changed()
+
+    def _update_next_goal_button_state(self):
+        super()._update_next_goal_button_state()
+        goals = self._goal_sequence_order()
+        has_goals = len(goals) > 0
+        with self._action_lock:
+            state = self._action_state
+        active = state in ("running", "paused", "awaiting_confirm", "awaiting_post_grasp")
+        idle = state == "idle"
+        if hasattr(self, "execute_goals_button"):
+            self.execute_goals_button.setEnabled(bool(has_goals and idle))
+        if hasattr(self, "clear_goals_button"):
+            self.clear_goals_button.setEnabled(bool(has_goals and idle))
+        if hasattr(self, "abort_goals_button"):
+            self.abort_goals_button.setEnabled(bool(has_goals or active))
+
+    def remove_selected_goal(self):
+        if not hasattr(self, "goal_list_widget"):
+            return
+        item = self.goal_list_widget.currentItem()
+        if item is None:
+            return
+        kind = item.data(Qt.ItemDataRole.UserRole)
+        if kind not in ("grasp", "reach"):
+            return
+        with self._action_lock:
+            if self._action_state != "idle":
+                self._set_status("Remove goals only while idle", "QLabel { color: orange; font-size: 10px; }")
+                return
+        self.queued_goals[kind] = None
+        self._reset_goal_sequence_progress()
+        self._set_status(f"Removed queued {kind} goal", "QLabel { color: #1e88e5; font-size: 10px; }")
+
+    def clear_queued_goals(self):
+        with self._action_lock:
+            if self._action_state != "idle":
+                self._set_status("Clear goals only while idle", "QLabel { color: orange; font-size: 10px; }")
+                return
+        self.queued_goals = {"grasp": None, "reach": None}
+        self._reset_goal_sequence_progress()
+        self._set_status("Cleared queued goals", "QLabel { color: gray; font-size: 10px; }")
+
+    def execute_all_queued_goals(self):
+        goals = self._goal_sequence_order()
+        if not goals:
+            self._set_status(
+                "No queued goals. Right-click image and add goals first.",
+                "QLabel { color: orange; font-size: 10px; }",
+            )
+            return
+        with self._action_lock:
+            if self._action_state != "idle":
+                self._set_status("Wait for current action to finish", "QLabel { color: orange; font-size: 10px; }")
+                return
+        self._reset_goal_sequence_progress()
+        self._deferred_next_goal_start = True
+        if not self._start_next_queued_goal():
+            self._deferred_next_goal_start = False
+            self._set_status("Failed to start goal execution", "QLabel { color: red; font-size: 10px; }")
+
+    def abort_and_clear_goals(self):
+        with self._action_lock:
+            state = self._action_state
+            self._action_abort_requested = True
+        self._deferred_next_goal_start = False
+        self._skip_to_next_goal_requested = False
+        self.queued_goals = {"grasp": None, "reach": None}
+        self._reset_goal_sequence_progress()
+        if state in ("paused", "awaiting_confirm", "awaiting_post_grasp"):
+            self._set_action_state("running")
+        if state == "idle":
+            self._set_status("Cleared queued goals", "QLabel { color: gray; font-size: 10px; }")
+        else:
+            self._set_status(
+                "Abort requested. Cleared queued goals.",
+                "QLabel { color: orange; font-size: 10px; }",
+            )
+
+    def keyPressEvent(self, event):
+        if event is not None and (not event.isAutoRepeat()):
+            if event.key() == Qt.Key.Key_Shift:
+                self._on_return_shortcut()
+                event.accept()
+                return
+            if event.key() == Qt.Key.Key_R:
+                mods = event.modifiers()
+                if not (mods & (Qt.KeyboardModifier.ControlModifier |
+                                Qt.KeyboardModifier.AltModifier |
+                                Qt.KeyboardModifier.MetaModifier)):
+                    self._on_record_shortcut()
+                    event.accept()
+                    return
+            if event.key() == Qt.Key.Key_E:
+                mods = event.modifiers()
+                if not (mods & (Qt.KeyboardModifier.ControlModifier |
+                                Qt.KeyboardModifier.AltModifier |
+                                Qt.KeyboardModifier.MetaModifier)):
+                    self._on_execute_goals_shortcut()
+                    event.accept()
+                    return
+        super().keyPressEvent(event)
+
+
+def main() -> None:
+    bridge = StretchAIDemoBridge()
+    try:
+        bridge.connect(timeout_s=STRETCH_AI_CONNECT_TIMEOUT_S)
+    except Exception as exc:
+        bridge.close()
+        raise SystemExit(f"stretch_ai bridge connection error: {exc}") from exc
+
+    app = QApplication(sys.argv)
+    ui = BridgeGoalQueueUI(bridge)
+    ui.show()
+
+    rc = 1
+    try:
+        rc = app.exec()
+    finally:
+        try:
+            bridge.publish_hold_stop()
+        except Exception:
+            pass
+        bridge.close()
+
+    raise SystemExit(rc)
+
+
+if __name__ == "__main__":
+    main()
