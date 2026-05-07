@@ -803,7 +803,7 @@ DEVICE_GRIPPER_TOGGLE_CLOSE_JOINT = -0.15
 DEVICE_PREC_LEVELS = 5  # prec 0..4
 DEVICE_BASE_STEP_MIN_M = 0.005
 DEVICE_BASE_STEP_MAX_M = 0.20
-DEVICE_ARM_STEP_MIN = 0.005
+DEVICE_ARM_STEP_MIN = 0.002
 DEVICE_ARM_STEP_MAX = 0.10
 DEVICE_GRIPPER_STEP_MIN = 0.005
 DEVICE_GRIPPER_STEP_MAX = 0.10
@@ -832,10 +832,10 @@ DEFAULT_BASE_ROTATE_STEP_DELAY_S = 0.10
 UI_STEP_SLIDER_DEFAULTS = [
     0.03,
     float(DEFAULT_BASE_ROTATE_STEP_DEG),
-    0.005,
+    0.01,
     0.02,
     0.02,
-    0.02,
+    0.01,
     float(DEFAULT_COMMAND_SMOOTH_DELAY_S),
 ]
 UI_STEP_IDX_BASE_LINEAR = 0
@@ -1098,6 +1098,10 @@ DRAG_CHAINED_MAX_INITIAL_RETRACT_M = 0.05
 CURVE_RESET_INTER_STEP_SETTLE_S = 0.015
 # Settle delay between linear drag type2 (joint-pair) return steps.
 LINEAR_RETURN_INTER_STEP_SETTLE_S = 0.02
+# Fast auto-replay tuning (replay only, never first manual trial).
+# We keep a small non-zero settle to preserve ordering safety while reducing idle gaps.
+FAST_AUTO_REPLAY_SETTLE_SCALE = 0.45
+FAST_AUTO_REPLAY_SETTLE_MIN_S = 0.004
 
 
 class PointStamped:
@@ -4816,7 +4820,7 @@ class RobotTeleopBridgeUI(QMainWindow):
         self.arm_speed = 0.01
         self.head_speed = 0.05
         self.wrist_speed = 0.05
-        self.gripper_step = 0.03
+        self.gripper_step = 0.01
         self.command_smoothing_delay_s = float(self.ros_node.command_smooth_delay_s)
 
         self.dataset_root = DEFAULT_DATASET_ROOT
@@ -5786,6 +5790,7 @@ class RobotTeleopUI(QMainWindow):
         self._auto_loop_abort = False
         self._auto_loop_mode = "pick_place"  # "pick_place" | "goal_sequence"
         self._auto_sequence_replay_active = False
+        self._fast_auto_replay_enabled = True
         self._auto_first_trial_pending = False
         self._auto_start_after_return = False
         self._auto_capture_enabled = False
@@ -12295,6 +12300,7 @@ class RobotTeleopUI(QMainWindow):
         reliable: bool = False,
         block_until_reached: bool = True,
         refresh_after_send: bool = True,
+        refresh_intermediate_after_send: bool = True,
         inter_step_delay_s: float | None = None,
     ) -> bool:
         """Execute arm_to in small steps using the same delay as manual speed slider."""
@@ -12388,6 +12394,11 @@ class RobotTeleopUI(QMainWindow):
             delay_s = float(np.clip(float(self.command_smoothing_delay), 0.01, 0.5))
         else:
             delay_s = max(0.0, float(inter_step_delay_s))
+        fast_replay_active = bool(self._is_fast_auto_replay_active())
+        effective_refresh_intermediate = bool(refresh_intermediate_after_send)
+        if bool(fast_replay_active):
+            # Replay fast-mode: keep final refresh, skip intermediate refresh waits.
+            effective_refresh_intermediate = False
 
         for i in range(1, n_steps + 1):
             if self._is_abort_requested():
@@ -12410,8 +12421,9 @@ class RobotTeleopUI(QMainWindow):
             # If gripper must ramp after arm motion, force final arm step blocking so
             # gripper starts only after other joints have reached the target.
             should_block = bool(is_last and (bool(block_until_reached) or bool(run_gripper_ramp_after_motion)))
+            do_refresh = bool(refresh_after_send) and (bool(should_block) or bool(effective_refresh_intermediate))
             pre_stamp_ns = None
-            if bool(refresh_after_send) and hasattr(self.ros_node, "_latest_ros_observation_stamp_ns"):
+            if bool(do_refresh) and hasattr(self.ros_node, "_latest_ros_observation_stamp_ns"):
                 try:
                     pre_stamp_ns = self.ros_node._latest_ros_observation_stamp_ns()
                 except Exception:
@@ -12434,7 +12446,7 @@ class RobotTeleopUI(QMainWindow):
             )
             if not ok:
                 return False
-            if bool(refresh_after_send) and hasattr(self.ros_node, "_refresh_state_from_ros_topic"):
+            if bool(do_refresh) and hasattr(self.ros_node, "_refresh_state_from_ros_topic"):
                 try:
                     self.ros_node._refresh_state_from_ros_topic(
                         require_newer_than_ns=pre_stamp_ns,
@@ -12474,8 +12486,12 @@ class RobotTeleopUI(QMainWindow):
                     )
                 )
                 is_last_grip = bool(gi == n_grip_steps)
+                do_refresh_grip = bool(refresh_after_send) and (
+                    bool(is_last_grip and bool(block_until_reached))
+                    or bool(effective_refresh_intermediate)
+                )
                 pre_stamp_ns = None
-                if bool(refresh_after_send) and hasattr(self.ros_node, "_latest_ros_observation_stamp_ns"):
+                if bool(do_refresh_grip) and hasattr(self.ros_node, "_latest_ros_observation_stamp_ns"):
                     try:
                         pre_stamp_ns = self.ros_node._latest_ros_observation_stamp_ns()
                     except Exception:
@@ -12497,7 +12513,7 @@ class RobotTeleopUI(QMainWindow):
                 )
                 if not ok:
                     return False
-                if bool(refresh_after_send) and hasattr(self.ros_node, "_refresh_state_from_ros_topic"):
+                if bool(do_refresh_grip) and hasattr(self.ros_node, "_refresh_state_from_ros_topic"):
                     try:
                         self.ros_node._refresh_state_from_ros_topic(
                             require_newer_than_ns=pre_stamp_ns,
@@ -12607,11 +12623,7 @@ class RobotTeleopUI(QMainWindow):
         )
         # Optional fast path for queued grasp. By default we keep confirmation
         # pauses so users can adjust before grasp/release.
-        auto_replay_fast_mode = bool(
-            bool(getattr(self, "_auto_sequence_replay_active", False))
-            and bool(getattr(self, "_auto_loop_running", False))
-            and (not bool(getattr(self, "_auto_first_trial_pending", False)))
-        )
+        auto_replay_fast_mode = bool(self._is_fast_auto_replay_active())
         capture_first_trial_pose = bool(
             bool(getattr(self, "_auto_capture_enabled", False))
             or (
@@ -12630,8 +12642,9 @@ class RobotTeleopUI(QMainWindow):
                 )
             )
         )
-        if bool(mode_is_precise_grasp) or bool(mode_is_precise_place):
-            auto_replay_fast_mode = False
+        # Precise modes keep manual confirmations in first trial, but should not
+        # force replay fast-path OFF when auto replay is active.
+        if (bool(mode_is_precise_grasp) or bool(mode_is_precise_place)) and (not bool(auto_replay_fast_mode)):
             fast_grasp_queue_mode = False
 
         def _wait_with_pause(duration_s: float) -> bool:
@@ -15636,7 +15649,13 @@ class RobotTeleopUI(QMainWindow):
                 import math
 
                 def _stage_sleep(duration_s):
-                    time.sleep(min(float(SCRIPT_STAGE_WAIT_CAP_S), max(0.0, float(duration_s))))
+                    sleep_s = min(float(SCRIPT_STAGE_WAIT_CAP_S), max(0.0, float(duration_s)))
+                    if bool(self._is_fast_auto_replay_active()):
+                        sleep_s = min(
+                            float(sleep_s),
+                            max(float(FAST_AUTO_REPLAY_SETTLE_MIN_S), float(sleep_s) * float(FAST_AUTO_REPLAY_SETTLE_SCALE)),
+                        )
+                    time.sleep(float(sleep_s))
 
                 def _restore_manip_base_x(
                     target_base_x: float,
@@ -17310,6 +17329,15 @@ class BridgeGoalQueueUI(RobotTeleopUI):
         self.auto_loop_record_button.setToolTip("Checked = save loop recording, unchecked = do not save.")
         self.auto_loop_record_button.toggled.connect(self._on_auto_loop_record_button_clicked)
         top_row.addWidget(self.auto_loop_record_button)
+        top_row.addSpacing(12)
+        top_row.addWidget(QLabel("Fast Auto Replay"))
+        self.fast_auto_replay_checkbox = QCheckBox()
+        self.fast_auto_replay_checkbox.setToolTip(
+            "Replay only: skip intermediate ROS refresh waits and reduce settle sleeps."
+        )
+        self.fast_auto_replay_checkbox.setChecked(bool(getattr(self, "_fast_auto_replay_enabled", True)))
+        self.fast_auto_replay_checkbox.toggled.connect(self._on_fast_auto_replay_toggled)
+        top_row.addWidget(self.fast_auto_replay_checkbox)
         auto_layout.addLayout(top_row)
 
         start_stop_row = QHBoxLayout()
@@ -17433,6 +17461,27 @@ class BridgeGoalQueueUI(RobotTeleopUI):
                 "QPushButton { background-color: #ffcdd2; color: #b71c1c; border: 1px solid #ef9a9a; }"
             )
 
+    def _on_fast_auto_replay_toggled(self, checked: bool) -> None:
+        self._fast_auto_replay_enabled = bool(checked)
+        if bool(self._fast_auto_replay_enabled):
+            self._set_status(
+                "Fast Auto Replay: ON",
+                "QLabel { color: #1e88e5; font-size: 10px; }",
+            )
+        else:
+            self._set_status(
+                "Fast Auto Replay: OFF",
+                "QLabel { color: gray; font-size: 10px; }",
+            )
+
+    def _is_fast_auto_replay_active(self) -> bool:
+        return bool(
+            bool(getattr(self, "_fast_auto_replay_enabled", False))
+            and bool(getattr(self, "_auto_sequence_replay_active", False))
+            and bool(getattr(self, "_auto_loop_running", False))
+            and (not bool(getattr(self, "_auto_first_trial_pending", False)))
+        )
+
     def _on_auto_loop_record_button_clicked(self, checked: bool) -> None:
         self._loop_record_armed = bool(checked)
         self._update_auto_loop_record_button_ui()
@@ -17539,6 +17588,25 @@ class BridgeGoalQueueUI(RobotTeleopUI):
 
     def _run_auto_goal_sequence_loop(self) -> None:
         loop_success = False
+        fast_replay_mode = bool(self._is_fast_auto_replay_active())
+        _linear_settle_base = float(globals().get("LINEAR_RETURN_INTER_STEP_SETTLE_S", 0.02))
+        _curve_settle_base = float(globals().get("CURVE_RESET_INTER_STEP_SETTLE_S", 0.015))
+        if bool(fast_replay_mode):
+            LINEAR_RETURN_INTER_STEP_SETTLE_S = float(
+                max(float(FAST_AUTO_REPLAY_SETTLE_MIN_S), _linear_settle_base * float(FAST_AUTO_REPLAY_SETTLE_SCALE))
+            )
+            CURVE_RESET_INTER_STEP_SETTLE_S = float(
+                max(float(FAST_AUTO_REPLAY_SETTLE_MIN_S), _curve_settle_base * float(FAST_AUTO_REPLAY_SETTLE_SCALE))
+            )
+        else:
+            LINEAR_RETURN_INTER_STEP_SETTLE_S = float(_linear_settle_base)
+            CURVE_RESET_INTER_STEP_SETTLE_S = float(_curve_settle_base)
+        print(
+            "[auto_loop speed] "
+            f"fast_replay={fast_replay_mode} "
+            f"linear_settle={LINEAR_RETURN_INTER_STEP_SETTLE_S:.4f}s "
+            f"curve_settle={CURVE_RESET_INTER_STEP_SETTLE_S:.4f}s"
+        )
 
         def _wait_until_idle(*, timeout_s: float, require_no_pre_state: bool = False) -> bool:
             end_t = time.time() + max(0.5, float(timeout_s))
